@@ -1,0 +1,9 @@
+{
+  "casePath": "F:/SIG/dataPreprocess/sampleData/1.cas.h5",
+  "outputImage": "F:/SIG/dataPreprocess/preprocess/out/viz_surface_mesh_full.png",
+  "trianglesOutput": "F:/SIG/dataPreprocess/preprocess/out/surface_triangles.npy",
+  "wireframe": true,
+  "color": "#555555",
+  "background": "white",
+  "includeZoneNames": null
+}

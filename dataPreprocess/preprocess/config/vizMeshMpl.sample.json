@@ -1,0 +1,8 @@
+{
+  "casePath": "F:/SIG/dataPreprocess/sampleData/1.cas.h5",
+  "nodeCoordPaths": [
+    "meshes/1/nodes/coords/1"
+  ],
+  "maxPoints": 250000,
+  "outputImage": "F:/SIG/dataPreprocess/preprocess/out/viz_mesh_nodes_mpl.png"
+}

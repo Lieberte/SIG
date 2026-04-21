@@ -1,0 +1,17 @@
+# dataPreprocess: core pipeline
+h5py==3.16.0
+numpy==2.4.4
+pandas==2.3.3
+
+# visualization / post
+matplotlib==3.10.8
+pyvista==0.47.3
+vtk==9.6.1
+pillow==12.2.0
+
+# training: deep learning
+torch
+torch_geometric==2.7.0
+
+# optional: fluent automation (not required for h5 extract + viz)
+# ansys-fluent-core==0.38.1

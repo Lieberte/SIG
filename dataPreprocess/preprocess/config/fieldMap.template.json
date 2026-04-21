@@ -1,0 +1,23 @@
+{
+  "requiredFields": [
+    "pressure",
+    "velocityX",
+    "velocityY",
+    "volumeFraction"
+  ],
+  "fieldPaths": {
+    "pressure": [],
+    "velocityX": [],
+    "velocityY": [],
+    "velocityZ": [],
+    "volumeFraction": [],
+    "temperature": []
+  },
+  "indexPaths": {
+    "datCellIds": [],
+    "casCellIds": []
+  },
+  "timePaths": {
+    "timeValue": []
+  }
+}

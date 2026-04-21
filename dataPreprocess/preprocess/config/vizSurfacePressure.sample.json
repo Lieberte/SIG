@@ -1,0 +1,7 @@
+{
+  "casePath": "F:/SIG/dataPreprocess/sampleData/1.cas.h5",
+  "datPath": "F:/SIG/dataPreprocess/sampleData/1.dat.h5",
+  "pressureDatasetPath": "results/1/phase-1/cells/SV_P/1",
+  "outputImage": "F:/SIG/dataPreprocess/preprocess/out/viz_surface_pressure_full.png",
+  "includeZoneNames": null
+}

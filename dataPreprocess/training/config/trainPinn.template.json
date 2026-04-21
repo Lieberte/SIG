@@ -1,0 +1,27 @@
+{
+  "mode": "pinn",
+  "snapshotMatrixPath": "preprocess/out/snapshotMatrix.npy",
+  "schemaPath": "preprocess/out/schema.json",
+  "topologyMetaPath": "preprocess/out/topologyMeta.json",
+  "casePath": "sampleData/1.cas.h5",
+  "fieldNames": ["u", "v", "p", "T", "rho", "alpha"],
+  "nSpatialDim": 3,
+  "nBcParams": 2,
+  "hiddenSize": 128,
+  "nBlocks": 6,
+  "physicsParams": {
+    "mu": 0.001,
+    "cp": 1000.0,
+    "k": 0.6
+  },
+  "enabledPdes": ["continuity", "momentumX", "momentumY", "energy", "vof"],
+  "lambdaData": 1.0,
+  "lambdaPhysics": 0.1,
+  "nCollocationPoints": 10000,
+  "learningRate": 0.001,
+  "nEpochs": 5000,
+  "patience": 200,
+  "batchSize": 4096,
+  "device": "cpu",
+  "outputDir": "training/out/pinn"
+}

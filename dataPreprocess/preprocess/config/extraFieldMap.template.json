@@ -1,0 +1,23 @@
+{
+  "requiredFields": [],
+  "datPathPrefix": "results/1",
+  "phaseNodes": {
+    "mixture": "phase-1",
+    "gas": "phase-2",
+    "liquid": "phase-3"
+  },
+  "fieldPaths": {
+    "pressure": [],
+    "velocityX": [],
+    "velocityY": [],
+    "velocityZ": [],
+    "volumeFraction": []
+  },
+  "indexPaths": {
+    "datCellIds": [],
+    "casCellIds": []
+  },
+  "timePaths": {
+    "timeValue": []
+  }
+}

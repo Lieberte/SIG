@@ -1,0 +1,10 @@
+{
+  "datPath": "F:/SIG/dataPreprocess/sampleData/1.dat.h5",
+  "scalarDatasetPath": "results/1/phase-1/cells/SV_P/1",
+  "histTitle": "SV_P phase-1 cells",
+  "histOutput": "F:/SIG/dataPreprocess/preprocess/out/viz_field_hist.png",
+  "cloudOutput": null,
+  "cellCentroidsNpy": null,
+  "scalarName": "pressure",
+  "maxPoints": 200000
+}

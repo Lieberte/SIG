@@ -1,0 +1,20 @@
+{
+  "casePath": "F:/SIG/dataPreprocess/sampleData/1.cas.h5",
+  "dataPaths": [
+    "F:/SIG/dataPreprocess/sampleData/1.dat.h5"
+  ],
+  "builtinFieldMapPath": "F:/SIG/dataPreprocess/preprocess/config/builtinFieldMap.fluent.json",
+  "extraFieldMapPath": "F:/SIG/dataPreprocess/preprocess/config/fieldMap.sample.json",
+  "outputDir": "F:/SIG/dataPreprocess/preprocess/out",
+  "fieldOrder": [
+    "velocityX",
+    "velocityY",
+    "pressure",
+    "volumeFraction"
+  ],
+  "missingFillValue": "nan",
+  "matrixFileName": "snapshotMatrix.npy",
+  "metadataFileName": "metadata.csv",
+  "schemaFileName": "schema.json",
+  "topologyMetaFileName": "topologyMeta.json"
+}

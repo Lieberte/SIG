@@ -1,0 +1,29 @@
+{
+  "requiredFields": [
+    "velocityX",
+    "velocityY",
+    "pressure",
+    "volumeFraction"
+  ],
+  "fieldPaths": {
+    "velocityX": [
+      "results/1/phase-1/cells/SV_U/1"
+    ],
+    "velocityY": [
+      "results/1/phase-1/cells/SV_V/1"
+    ],
+    "pressure": [
+      "results/1/phase-1/cells/SV_P/1"
+    ],
+    "volumeFraction": [
+      "results/1/phase-2/cells/SV_VOF/1"
+    ]
+  },
+  "indexPaths": {
+    "datCellIds": [],
+    "casCellIds": []
+  },
+  "timePaths": {
+    "timeValue": []
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "mode": "gnn",
+  "snapshotMatrixPath": "preprocess/out/snapshotMatrix.npy",
+  "schemaPath": "preprocess/out/schema.json",
+  "topologyMetaPath": "preprocess/out/topologyMeta.json",
+  "casePath": "sampleData/1.cas.h5",
+  "fieldNames": null,
+  "seqLen": 10,
+  "batchSize": 4,
+  "hiddenSize": 64,
+  "convType": "gat",
+  "nHeads": 4,
+  "nConvLayers": 3,
+  "nGruLayers": 1,
+  "dropout": 0.0,
+  "useEdgeAttr": true,
+  "learningRate": 0.001,
+  "nEpochs": 200,
+  "patience": 20,
+  "valSplit": 0.2,
+  "device": "cpu",
+  "outputDir": "training/out/gnn"
+}

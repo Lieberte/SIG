@@ -1,0 +1,9 @@
+{
+  "mode": "csr",
+  "cellNodeOffsetPaths": [],
+  "cellNodeIndexPaths": [],
+  "nodeCoordPaths": [
+    "meshes/1/nodes/coords/1"
+  ],
+  "nNodes": null
+}
