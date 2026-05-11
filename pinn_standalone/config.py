@@ -222,10 +222,10 @@ class PINNConfig:
     K_drag_12: float = 1.0e4   # phase-1 ↔ phase-2
     K_drag_13: float = 5.0e4   # phase-1 ↔ phase-3
 
-    # ── Solid (aluminium) ──
-    rho_solid: float = 2719.0
-    cp_solid: float = 871.0
-    k_solid: float = 202.4
+    # ── Solid (polymer / non-metallic wall) ──
+    rho_solid: float = 1000.0
+    cp_solid: float = 1500.0
+    k_solid: float = 0.114
 
     # ── PDE enabling ──
     enabled_pdes: set[str] = field(default_factory=lambda: {
