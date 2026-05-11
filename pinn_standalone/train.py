@@ -200,9 +200,11 @@ class ParametricTrainer:
             metrics['loss_physics'] = float(physics_loss.item())
 
         # ── 2. Data fitting (all 20 fields) ──
+        # Reuse this pred for species/VOF constraints below (avoid redundant forward passes)
+        pred_dat = None
         if x_dat is not None:
-            pred = self.model(x_dat, t_dat, bc_dat)
-            data_diff = pred - v_dat
+            pred_dat = self.model(x_dat, t_dat, bc_dat)
+            data_diff = pred_dat - v_dat
             field_mse = (data_diff ** 2).mean(dim=0)
             d_loss = field_mse.mean()
             loss += lambda_data * d_loss
@@ -227,29 +229,23 @@ class ParametricTrainer:
         # ── 5. Initial condition loss ──
         if x_init is not None:
             t0 = torch.zeros(x_init.shape[0], 1, device=self.device)
-            pred = self.model(x_init, t0, bc_init)
-            i_loss = ((pred - v_init) ** 2).mean()
+            pred_init = self.model(x_init, t0, bc_init)
+            i_loss = ((pred_init - v_init) ** 2).mean()
             loss += self.cfg.lambda_initial * i_loss
             metrics['loss_initial'] = i_loss.item()
 
-        # ── 6. Species sum constraint ──
-        if x_dat is not None:
-            pred = self.model(x_dat, t_dat, bc_dat)
-            # Phase 2 species sum → 1
-            sp2_sum = pred[:, F_Y_H2O2_V] + pred[:, F_Y_H2O_V] + pred[:, F_Y_AIR_V]
+        # ── 6. Species sum constraint (reuses pred_dat from step 2) ──
+        if pred_dat is not None:
+            sp2_sum = pred_dat[:, F_Y_H2O2_V] + pred_dat[:, F_Y_H2O_V] + pred_dat[:, F_Y_AIR_V]
             sp2_loss = ((sp2_sum - 1.0) ** 2).mean()
-            # Phase 3 species sum → 1
-            sp3_sum = pred[:, F_Y_H2O2_L] + pred[:, F_Y_H2O_L]
+            sp3_sum = pred_dat[:, F_Y_H2O2_L] + pred_dat[:, F_Y_H2O_L]
             sp3_loss = ((sp3_sum - 1.0) ** 2).mean()
             sp_loss = sp2_loss + sp3_loss
             loss += self.cfg.lambda_species * sp_loss
             metrics['loss_species_sum'] = sp_loss.item()
 
-        # ── 7. VOF sum constraint  (vof1 = 1 - vof2 - vof3, so vof2 + vof3 ≤ 1) ──
-        if x_dat is not None:
-            pred = self.model(x_dat, t_dat, bc_dat)
-            vof_sum = pred[:, F_VOF2] + pred[:, F_VOF3]
-            # Penalize vof2 + vof3 > 1
+            # ── 7. VOF sum constraint (reuses pred_dat from step 2) ──
+            vof_sum = pred_dat[:, F_VOF2] + pred_dat[:, F_VOF3]
             vof_excess = torch.clamp(vof_sum - 1.0, min=0.0)
             vof_loss = (vof_excess ** 2).mean()
             loss += self.cfg.lambda_vof * vof_loss

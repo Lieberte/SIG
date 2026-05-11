@@ -151,7 +151,7 @@ class PINNConfig:
     n_data_points: int = 80000
     n_initial_points: int = 8000
     n_solid_temp_points: int = 8000
-    solid_viz_interval: int = 30
+    solid_viz_interval: int = 3
     solid_viz_case_idx: int = 0
     solid_viz_time_idx: int = -1
     n_bc_points: int = 4000
