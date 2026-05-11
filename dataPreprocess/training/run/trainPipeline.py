@@ -83,52 +83,137 @@ def _saveHistory(history: dict, outputDir: Path) -> None:
 # ── Phase A ─────────────────────────────────────────────────
 
 def runEndToEnd(config: dict) -> dict:
+    """
+    End-to-end training: boundary conditions → surface field prediction.
+
+    Supported encoder types (config['encoderType']):
+    - 'tcn': Temporal Convolutional Network (default, best for short sequences)
+    - 'rnn': Hand-written Elman RNN (explicit state equations)
+    - 'lstm': PyTorch LSTM (for longer sequences)
+    - 'mlp': Simple MLP (one-to-one, no time window)
+    """
+    from training.endToEnd.model import bcToSurfaceModel, mlpModel, rnnModel
+    from training.shared.dataSplit import temporal_split
+
     matrix = np.load(config["snapshotMatrixPath"])
     schema = loadSchema(Path(config["schemaPath"]))
     topologyMeta = loadTopologyMeta(Path(config["topologyMetaPath"]))
     casePath = Path(config["casePath"])
     pair = extractBcAndTarget(matrix, schema, topologyMeta, casePath, config)
     bcInput, surfaceTarget = pair["bcInput"], pair["surfaceTarget"]
+    nOutputFeatures = surfaceTarget.shape[1] if surfaceTarget.ndim > 1 else 1
+
     bcScaler, targetScaler = standardScaler(), standardScaler()
     if config.get("normalize", True):
         bcInput = bcScaler.fitTransform(bcInput)
         surfaceTarget = targetScaler.fitTransform(surfaceTarget)
-    seqLen = config.get("seqLen", 10)
-    dataset = timeSeriesDataset(bcInput, surfaceTarget, seqLen=seqLen)
+
+    encoderType = config.get("encoderType", "tcn")
+
+    if encoderType == "mlp":
+        # MLP: no time window needed, each step is independent
+        dataset = torch.utils.data.TensorDataset(
+            torch.from_numpy(bcInput.astype(np.float32)),
+            torch.from_numpy(surfaceTarget.astype(np.float32)),
+        )
+        seqLen = 1
+    elif encoderType == "rnn":
+        seqLen = config.get("seqLen", 5)
+        dataset = timeSeriesDataset(bcInput, surfaceTarget, seqLen=seqLen)
+    else:
+        # TCN or LSTM: uses time window
+        seqLen = config.get("seqLen", 5)
+        dataset = timeSeriesDataset(bcInput, surfaceTarget, seqLen=seqLen)
+
     if len(dataset) == 0:
         raise ValueError(f"not enough snapshots ({matrix.shape[1]}) for seqLen={seqLen}")
-    nTrain, nVal = splitTrainVal(len(dataset), config.get("valSplit", 0.2))
-    trainDs, valDs = torch.utils.data.random_split(dataset, [nTrain, nVal])
+
+    # Temporal split (no leakage)
+    nSamples = len(dataset)
+    valRatio = config.get("valSplit", 0.2)
+    testRatio = config.get("testRatio", 0.0)
+    trainIdx, valIdx, testIdx = temporal_split(nSamples, valRatio, testRatio)
+
+    trainDs = torch.utils.data.Subset(dataset, trainIdx)
+    valDs = torch.utils.data.Subset(dataset, valIdx) if len(valIdx) > 0 else None
+
     batchSize = config.get("batchSize", 32)
     trainLoader = DataLoader(trainDs, batch_size=batchSize, shuffle=True)
-    valLoader = DataLoader(valDs, batch_size=batchSize) if nVal > 0 else None
-    model = bcToSurfaceModel(
-        nInputFeatures=bcInput.shape[1],
-        nOutputFeatures=surfaceTarget.shape[1] if surfaceTarget.ndim > 1 else 1,
-        hiddenSize=config.get("hiddenSize", 128),
-        nLayers=config.get("nLayers", 2),
-        dropout=config.get("dropout", 0.1),
-    )
+    valLoader = DataLoader(valDs, batch_size=batchSize) if valDs is not None else None
+
+    if encoderType == "mlp":
+        model = mlpModel(
+            nInputFeatures=bcInput.shape[1],
+            nOutputFeatures=nOutputFeatures,
+            hiddenSize=config.get("hiddenSize", 128),
+            nHiddenLayers=config.get("nLayers", 3),
+            dropout=config.get("dropout", 0.1),
+            activation=config.get("activation", "relu"),
+        )
+    elif encoderType == "rnn":
+        model = rnnModel(
+            nInputFeatures=bcInput.shape[1],
+            nOutputFeatures=nOutputFeatures,
+            hiddenSize=config.get("hiddenSize", 128),
+            activation=config.get("activation", "tanh"),
+            dropout=config.get("dropout", 0.1),
+        )
+    else:
+        model = bcToSurfaceModel(
+            nInputFeatures=bcInput.shape[1],
+            nOutputFeatures=nOutputFeatures,
+            hiddenSize=config.get("hiddenSize", 128),
+            nLayers=config.get("nLayers", 2),
+            dropout=config.get("dropout", 0.1),
+            encoderType=encoderType,
+            kernelSize=config.get("kernelSize", 3),
+        )
+
     device = config.get("device", "cpu")
-    trainer = romTrainer(model, torch.optim.Adam(model.parameters(), lr=config.get("learningRate", 1e-3)), torch.nn.MSELoss(), device=device)
-    history = trainer.fit(trainLoader, valLoader, nEpochs=config.get("nEpochs", 200), patience=config.get("patience", 20))
+    trainer = romTrainer(
+        model,
+        torch.optim.Adam(model.parameters(), lr=config.get("learningRate", 1e-3)),
+        torch.nn.MSELoss(),
+        device=device,
+    )
+    history = trainer.fit(
+        trainLoader, valLoader,
+        nEpochs=config.get("nEpochs", 200),
+        patience=config.get("patience", 20),
+    )
+
     outputDir = Path(config["outputDir"])
     outputDir.mkdir(parents=True, exist_ok=True)
+
     torch.save(model.state_dict(), outputDir / "model.pt")
     _saveHistory(history, outputDir)
+
     if config.get("normalize", True):
-        np.savez(outputDir / "scalers.npz", bcMean=bcScaler.mean, bcStd=bcScaler.std, targetMean=targetScaler.mean, targetStd=targetScaler.std)
+        np.savez(
+            outputDir / "scalers.npz",
+            bcMean=bcScaler.mean,
+            bcStd=bcScaler.std,
+            targetMean=targetScaler.mean,
+            targetStd=targetScaler.std,
+        )
+
     report = {
         "mode": "endToEnd",
+        "encoderType": encoderType,
+        "seqLen": seqLen,
         "nWallCells": int(pair["wallCellIds"].size),
         "nInletCells": int(pair["inletCellIds"].size),
         "nSnapshots": int(matrix.shape[1]),
-        "nTrainSamples": nTrain,
-        "nValSamples": nVal,
+        "nTrainSamples": len(trainIdx),
+        "nValSamples": len(valIdx),
+        "nTestSamples": len(testIdx),
+        "splitStrategy": "temporal",
         "finalTrainLoss": float(history["trainLoss"][-1]) if history["trainLoss"] else None,
         "finalValLoss": float(history["valLoss"][-1]) if history["valLoss"] else None,
     }
-    (outputDir / "trainReport.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    (outputDir / "trainReport.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8",
+    )
     return report
 
 
@@ -509,6 +594,7 @@ def runGnn(config: dict) -> dict:
 
     nNodeFeatures = nodeFeatures.shape[2]
     convType = config.get("convType", "gat")
+    temporalType = config.get("temporalType", "gru")
     edgeDim = edgeAttrNp.shape[1] if edgeAttrNp is not None else None
 
     model = temporalMeshGnn(
@@ -521,6 +607,8 @@ def runGnn(config: dict) -> dict:
         nGruLayers=config.get("nGruLayers", 1),
         dropout=config.get("dropout", 0.0),
         edgeDim=edgeDim if convType == "gat" else None,
+        temporalType=temporalType,
+        kernelSize=config.get("kernelSize", 3),
     )
 
     device = config.get("device", "cpu")
@@ -564,6 +652,7 @@ def runGnn(config: dict) -> dict:
     report = {
         "mode": "gnn",
         "convType": convType,
+        "temporalType": temporalType,
         "useEdgeAttr": useEdgeAttr,
         "nCells": graph["nCells"],
         "nEdges": graph["nEdges"],

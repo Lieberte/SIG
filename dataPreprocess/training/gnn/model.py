@@ -1,6 +1,81 @@
 import torch
 import torch.nn as nn
-from torch_geometric.nn import GATConv, GCNConv, GraphNorm, SAGEConv, MessagePassing
+from torch_geometric.nn import GATConv, GCNConv, GraphNorm, SAGEConv
+
+
+class Chomp1d(nn.Module):
+    """Remove extra elements from the end of the sequence."""
+
+    def __init__(self, chompSize: int):
+        super().__init__()
+        self.chompSize = chompSize
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x[:, :, :-self.chompSize].contiguous()
+
+
+class TemporalBlock(nn.Module):
+    """Dilated causal 1D convolution block for TCN."""
+
+    def __init__(
+        self,
+        inChannels: int,
+        outChannels: int,
+        kernelSize: int,
+        dilation: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        padding = (kernelSize - 1) * dilation
+        self.conv1 = nn.utils.weight_norm(
+            nn.Conv1d(inChannels, outChannels, kernelSize, padding=padding, dilation=dilation)
+        )
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.utils.weight_norm(
+            nn.Conv1d(outChannels, outChannels, kernelSize, padding=padding, dilation=dilation)
+        )
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(
+            self.conv1, self.chomp1, self.relu1, self.dropout1,
+            self.conv2, self.chomp2, self.relu2, self.dropout2,
+        )
+        self.downsample = (
+            nn.Conv1d(inChannels, outChannels, 1) if inChannels != outChannels else None
+        )
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class TemporalConvNet(nn.Module):
+    """TCN encoder."""
+
+    def __init__(
+        self,
+        numInputs: int,
+        numChannels: list[int],
+        kernelSize: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        layers = []
+        for i, nOut in enumerate(numChannels):
+            inCh = numInputs if i == 0 else numChannels[i - 1]
+            dilation = 2 ** i
+            layers.append(TemporalBlock(inCh, nOut, kernelSize, dilation, dropout))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 class gcnBlock(nn.Module):
@@ -103,10 +178,11 @@ class spatialGnnModel(nn.Module):
 
 class temporalMeshGnn(nn.Module):
     """
-    Temporal mesh GNN model.
+    Temporal mesh GNN: spatial GNN encoding + temporal modeling.
 
-    Uses efficient batch encoding by reshaping (batch*seqLen, nNodes, feat)
-    into a single forward pass through the GNN encoder.
+    Supports two temporal encoders:
+    - 'gru': GRU (default, good for short sequences)
+    - 'tcn': Temporal Convolutional Network (better for capturing local patterns)
     """
 
     def __init__(
@@ -120,17 +196,27 @@ class temporalMeshGnn(nn.Module):
         nGruLayers: int = 1,
         dropout: float = 0.0,
         edgeDim: int | None = None,
+        temporalType: str = "gru",
+        kernelSize: int = 3,
     ):
         super().__init__()
         self.hiddenSize = hiddenSize
+        self.temporalType = temporalType
+
         self.gnnEncoder = meshGnnEncoder(
             nNodeFeatures, hiddenSize, nConvLayers, convType, nHeads, dropout, edgeDim,
         )
-        self.temporal = nn.GRU(
-            hiddenSize, hiddenSize,
-            num_layers=nGruLayers, batch_first=True,
-            dropout=dropout if nGruLayers > 1 else 0.0,
-        )
+
+        if temporalType == "tcn":
+            numChannels = [hiddenSize] * nGruLayers
+            self.temporal = TemporalConvNet(hiddenSize, numChannels, kernelSize, dropout)
+        else:
+            self.temporal = nn.GRU(
+                hiddenSize, hiddenSize,
+                num_layers=nGruLayers, batch_first=True,
+                dropout=dropout if nGruLayers > 1 else 0.0,
+            )
+
         self.decoder = nn.Sequential(
             nn.Linear(hiddenSize, hiddenSize),
             nn.ReLU(),
@@ -149,17 +235,6 @@ class temporalMeshGnn(nn.Module):
         edgeIndex: torch.Tensor,
         edgeAttr: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Encode a batch of frames efficiently using PyG-style batching.
-
-        Args:
-            nodeFeatures: (batch, nNodes, feat)
-            edgeIndex: (2, nEdges) - shared topology
-            edgeAttr: (nEdges, edgeDim) or None
-
-        Returns:
-            (batch, nNodes, hiddenSize)
-        """
         batch, nNodes, nFeat = nodeFeatures.shape
         # Offset edge indices for each graph in the batch
         offsets = torch.arange(batch, device=nodeFeatures.device).unsqueeze(1) * nNodes
@@ -187,17 +262,27 @@ class temporalMeshGnn(nn.Module):
         # Encode each time step with batched graph processing
         allEmbeddings = []
         for t in range(seqLen):
-            # (batch, nNodes, hiddenSize)
             emb = self._encodeBatchFrame(nodeFeatureSeq[:, t], edgeIndex, edgeAttr)
             allEmbeddings.append(emb)
 
         # (batch, seqLen, nNodes, hiddenSize)
         embeddings = torch.stack(allEmbeddings, dim=1)
 
-        # Temporal: permute to (batch*nNodes, seqLen, hiddenSize) for GRU
-        flat = embeddings.permute(0, 2, 1, 3).reshape(batch * nNodes, seqLen, self.hiddenSize)
-        temporal, _ = self.temporal(flat)
-        last = temporal[:, -1, :].reshape(batch, nNodes, -1)
+        # Temporal modeling
+        if self.temporalType == "tcn":
+            # TCN expects (batch*nNodes, hiddenSize, seqLen)
+            flat = embeddings.permute(0, 2, 3, 1).reshape(
+                batch * nNodes, self.hiddenSize, seqLen
+            )
+            temporal = self.temporal(flat)
+            # Take last time step: (batch*nNodes, hiddenSize, 1)
+            last = temporal[:, :, -1].reshape(batch, nNodes, -1)
+        else:
+            # GRU expects (batch*nNodes, seqLen, hiddenSize)
+            flat = embeddings.permute(0, 2, 1, 3).reshape(batch * nNodes, seqLen, self.hiddenSize)
+            temporal, _ = self.temporal(flat)
+            last = temporal[:, -1, :].reshape(batch, nNodes, -1)
+
         return self.decoder(last)
 
     @torch.no_grad()

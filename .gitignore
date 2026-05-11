@@ -16,6 +16,7 @@ env/
 # IDE
 .idea/
 .vscode/
+.agents/
 
 # OS
 .DS_Store
@@ -45,6 +46,10 @@ dataPreprocess/training/out/
 # HDF5 data files
 *.h5
 *.hdf5
+*.vtk
+*.csv
+*.txt
+*.xml
 
 # Documents and media
 *.pdf
@@ -57,6 +62,7 @@ dataPreprocess/training/out/
 *.gif
 *.bmp
 *.svg
+*.md
 
 # Temporary files
 *.tmp
