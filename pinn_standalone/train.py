@@ -20,7 +20,8 @@ from pinn_model import PINNModel, PhysicsLoss, InletBCLoss, udf_inlet_temperatur
 from data_loader import (
     load_cas, build_multi_case_training_data, split_case_data, load_inlet_coords,
     make_collocation_points, make_data_points, make_initial_points,
-    make_solid_temp_points, make_solid_temp_snapshot, make_bc_points,
+    make_solid_temp_points, make_inner_surface_temp_points,
+    make_solid_temp_snapshot, make_bc_points,
 )
 
 # Field name groups for logging
@@ -546,14 +547,15 @@ def main():
                                 batch_size=pinn_cfg.batch_size, shuffle=True)
     print(f"  initial:     {n_init} points")
 
-    # Solid T
+    # Solid T — focused on inner surface (sterilization-critical region)
     n_solid_pts = pinn_cfg.n_solid_temp_points
-    x_s, t_s, T_s, bc_s = make_solid_temp_points(train_data, n_solid_pts, rng)
+    x_s, t_s, T_s, bc_s = make_inner_surface_temp_points(train_data, n_solid_pts, rng)
     if len(x_s) > 0:
         solid_temp_loader = DataLoader(TensorDataset(x_s, t_s, T_s, bc_s),
                                        batch_size=pinn_cfg.batch_size, shuffle=True)
         solid_viz_data = make_solid_temp_snapshot(train_data, pinn_cfg.solid_viz_case_idx, pinn_cfg.solid_viz_time_idx)
-        print(f"  solid_T:     {n_solid_pts} points, viz every {pinn_cfg.solid_viz_interval} epochs")
+        print(f"  solid_T:     {n_solid_pts} points (inner-surface focused), "
+              f"viz every {pinn_cfg.solid_viz_interval} epochs")
     else:
         solid_temp_loader = None; solid_viz_data = None
         print(f"  solid_T:     SKIP")

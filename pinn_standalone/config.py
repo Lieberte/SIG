@@ -135,27 +135,27 @@ class PINNConfig:
     use_discrete_time_input: bool = True
     hard_inlet_bc: bool = True
     val_case_ratio: float = 0.3
-    n_val_data_points: int = 5000
-    n_val_solid_temp_points: int = 2000
+    n_val_data_points: int = 15000
+    n_val_solid_temp_points: int = 5000
 
     # ── Training ──
     device: str = field(default_factory=default_device)
     learning_rate: float = 1e-4
     n_epochs: int = 3000
-    batch_size_colloc: int = 256
-    batch_size_boundary: int = 256
-    batch_size_data: int = 256
+    batch_size_colloc: int = 512
+    batch_size_boundary: int = 512
+    batch_size_data: int = 512
 
-    n_collocation: int = 5000
-    n_collocation_points: int = 5000
-    n_data_points: int = 20000
-    n_initial_points: int = 2000
-    n_solid_temp_points: int = 2000
+    n_collocation: int = 20000
+    n_collocation_points: int = 20000
+    n_data_points: int = 80000
+    n_initial_points: int = 8000
+    n_solid_temp_points: int = 8000
     solid_viz_interval: int = 30
     solid_viz_case_idx: int = 0
     solid_viz_time_idx: int = -1
-    n_bc_points: int = 1000
-    batch_size: int = 256
+    n_bc_points: int = 4000
+    batch_size: int = 512
     collocation_perturb: float = 0.001
     bc_loss_interval: int = 1
 
@@ -165,7 +165,7 @@ class PINNConfig:
     lambda_data: float = 5.0
     lambda_physics_fluid: float = 1.0
     lambda_physics_solid: float = 1.0
-    lambda_solid_temp: float = 2.0
+    lambda_solid_temp: float = 10.0  # inner surface T supervision (sterilization-critical)
     lambda_bc_inlet: float = 50.0
     lambda_bc_wall: float = 5.0
     lambda_initial: float = 5.0

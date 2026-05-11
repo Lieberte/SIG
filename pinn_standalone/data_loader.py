@@ -486,12 +486,20 @@ def build_multi_case_training_data(mesh, data_root: Path, dat_glob: str,
         })
 
     first = cases[0]
+    # Classify solid cells for targeted surface supervision
+    solid_classification = classify_solid_cells(mesh, n_solid)
+    print(f"  Solid classification: inner={len(solid_classification['inner_surface']):,}, "
+          f"outer={len(solid_classification['outer_surface']):,}, "
+          f"exterior={len(solid_classification['exterior']):,}, "
+          f"interior={len(solid_classification['interior']):,}")
+
     return {
         "cases": cases,
         "n_cases": len(cases),
         "cell_centers": cell_centers,
         "fluid_coords": fluid_coords,
         "solid_coords": solid_coords,
+        "solid_classification": solid_classification,  # NEW
         "T_preheat_K": first["T_preheat_K"],
         "T_h2o2_K": first["T_h2o2_K"],
         "norm_coords": norm_fluid_coords,
@@ -524,6 +532,93 @@ def build_multi_case_training_data(mesh, data_root: Path, dat_glob: str,
 # ── Point samplers (20-field aware) ──────────────────────────
 
 import torch  # noqa: E402
+
+
+def get_solid_inner_surface_cells(mesh: dict, n_solid: int) -> np.ndarray:
+    """Identify solid cells adjacent to the inner fluid chamber (fluid_i).
+
+    Uses the fluid_i-soild-shadow face zone (zone id=3) to find solid cells
+    whose faces contact the inner fluid zone. These are the critical cells
+    for sterilization temperature prediction.
+
+    Returns:
+        inner_cells: int32 array of 0-based solid-local cell indices
+    """
+    face_c0 = mesh["face_c0"]
+    with h5py.File(mesh.get("_cas_path", ""), "r") as f:
+        pass  # We use pre-loaded mesh data
+
+    # The mesh dict already has face_c0 loaded. We need to find faces in
+    # the shadow zone (zone 3: fluid_i-soild-shadow, c0=solid cells).
+    # Load zone ranges from mesh dict's zones info
+    zones = mesh.get("zones", {})
+    # Look for the shadow zone — face IDs for solid→fluid_i faces
+    # From earlier analysis: shadow zone has faces [88120, 118294]
+
+    # Actually, let's find it dynamically from the zones dict
+    target_zone = None
+    for name, info in zones.items():
+        if "fluid_i-soild-shadow" in name or name == "fluid_i-soild-shadow":
+            target_zone = info
+            break
+
+    if target_zone is None:
+        # Fallback: hardcoded range from mesh analysis
+        face_min, face_max = 88120, 118294
+    else:
+        face_min, face_max = target_zone["face_min"], target_zone["face_max"]
+
+    inner_cells = set()
+    for fid in range(face_min - 1, face_max):  # 1-based → 0-based
+        c0 = int(face_c0[fid])
+        if 0 <= c0 < n_solid:
+            inner_cells.add(c0)
+
+    return np.array(sorted(inner_cells), dtype=np.int32)
+
+
+def classify_solid_cells(mesh: dict, n_solid: int) -> dict[str, np.ndarray]:
+    """Classify all solid cells by surface type.
+
+    Returns dict with keys: inner_surface, outer_surface, exterior, interior
+    Each value is a 0-based solid-local index array.
+    """
+    face_c0 = mesh["face_c0"]
+    zones = mesh.get("zones", {})
+    n_solid_int = int(n_solid)
+
+    inner_surface = set()
+    outer_surface = set()
+    exterior = set()
+
+    for name, info in zones.items():
+        fm, fmax = info["face_min"], info["face_max"]
+        if "fluid_i-soild-shadow" in name:
+            for fid in range(fm - 1, fmax):
+                c0 = int(face_c0[fid])
+                if 0 <= c0 < n_solid_int:
+                    inner_surface.add(c0)
+        elif "fluid_o-soild-shadow" in name:
+            for fid in range(fm - 1, fmax):
+                c0 = int(face_c0[fid])
+                if 0 <= c0 < n_solid_int:
+                    outer_surface.add(c0)
+        elif "soild:1" == name or name.startswith("soild:"):
+            for fid in range(fm - 1, fmax):
+                c0 = int(face_c0[fid])
+                if 0 <= c0 < n_solid_int:
+                    exterior.add(c0)
+
+    all_solid = set(range(n_solid_int))
+    all_surface = inner_surface | outer_surface | exterior
+    interior = all_solid - all_surface
+
+    return {
+        "inner_surface": np.array(sorted(inner_surface), dtype=np.int32),
+        "outer_surface": np.array(sorted(outer_surface), dtype=np.int32),
+        "exterior": np.array(sorted(exterior), dtype=np.int32),
+        "interior": np.array(sorted(interior), dtype=np.int32),
+    }
 
 
 def _sample_cases(data: dict, n_points: int, rng) -> np.ndarray:
@@ -714,6 +809,73 @@ def make_solid_temp_snapshot(data: dict, case_idx: int = 0, time_idx: int = -1) 
     return (torch.from_numpy(x).float(),
             torch.from_numpy(t).float(),
             torch.from_numpy(v_T.astype(np.float32)).float(),
+            torch.from_numpy(bc_params).float())
+
+
+def make_inner_surface_temp_points(data: dict, n_points: int, rng) -> tuple:
+    """Generate solid temperature supervision points focused on the inner surface.
+
+    Samples preferentially from inner surface cells (the sterilization-critical region).
+    Falls back to uniform sampling if no classification data is available.
+    """
+    n_solid = data["n_solid"]
+    if n_solid == 0:
+        return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
+
+    classification = data.get("solid_classification", {})
+    inner_cells = classification.get("inner_surface", None)
+
+    if inner_cells is not None and len(inner_cells) > 0:
+        # 70% inner surface, 20% outer surface, 10% rest
+        n_inner = int(n_points * 0.7)
+        n_outer = int(n_points * 0.2)
+        n_random = n_points - n_inner - n_outer
+
+        outer_cells = classification.get("outer_surface",
+                       np.array([], dtype=np.int32))
+        all_cells = np.arange(n_solid, dtype=np.int32)
+
+        inner_idx = rng.choice(inner_cells, size=n_inner, replace=True)
+        outer_idx = (rng.choice(outer_cells, size=n_outer, replace=True)
+                     if len(outer_cells) > 0 and n_outer > 0
+                     else np.array([], dtype=np.int32))
+        random_idx = rng.choice(all_cells, size=n_random, replace=True)
+
+        cell_idx = np.concatenate([inner_idx, outer_idx, random_idx])
+        rng.shuffle(cell_idx)
+    else:
+        cell_idx = rng.integers(0, n_solid, size=n_points)
+
+    case_idx = _sample_cases(data, n_points, rng)
+    coord_idx = data["n_fluid"] + cell_idx
+    x = data["norm_coords_all"][coord_idx]
+    t = np.zeros((n_points, 1), dtype=np.float32)
+    v_T = np.zeros((n_points, 1), dtype=np.float32)
+    bc_params = np.zeros((n_points, 2), dtype=np.float32)
+
+    if "cases" in data:
+        for case_id, case in enumerate(data["cases"]):
+            idx = case_idx == case_id
+            if idx.sum() == 0 or len(case["norm_solid_T"]) == 0:
+                continue
+            time_idx = rng.integers(0, case["n_time"], size=idx.sum())
+            solid_array = np.array(case["norm_solid_T"])
+            t[idx, 0] = case["norm_times"][time_idx]
+            v_T[idx, 0] = solid_array[time_idx, cell_idx[idx]]
+            bc_params[idx] = _case_params(case, idx.sum())
+    else:
+        time_idx = rng.integers(0, data["n_time"], size=n_points)
+        solid_array = np.array(data["norm_solid_T"])
+        t[:, 0] = data["norm_times"][time_idx]
+        v_T[:, 0] = solid_array[time_idx, cell_idx]
+        bc_params[:] = np.array([
+            (data["T_preheat_K"] - data["T_min"]) / data["T_range"],
+            (data["T_h2o2_K"] - data["T_min"]) / data["T_range"],
+        ], dtype=np.float32)
+
+    return (torch.from_numpy(x).float(),
+            torch.from_numpy(t).float(),
+            torch.from_numpy(v_T).float(),
             torch.from_numpy(bc_params).float())
 
 
