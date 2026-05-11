@@ -19,6 +19,7 @@ from config import (
     F_Y_H2O2_V, F_Y_H2O_V, F_Y_AIR_V,
     F_Y_H2O2_L, F_Y_H2O_L,
     VEL_SLICES, SPECIES_SLICES, BULK_SPECIES,
+    SV_Y_TO_FIELD_P2, SV_Y_TO_FIELD_P3,
 )
 
 
@@ -190,14 +191,13 @@ def load_multi_fluid_fields(dat_dir: Path, dat_glob: str) -> tuple:
             # Temperature: average phase 2 and 3 (thermal equilibrium assumption)
             fd[:, F_T] = (sv_t2 + sv_t3) * 0.5
 
-            # Phase 2 species (3): h2o, h2o2, air-vapor
-            fd[:, F_Y_H2O2_V] = sv_y2[:, 1]  # column order inferred: 0=h2o, 1=h2o2, 2=bulk
-            fd[:, F_Y_H2O_V]  = sv_y2[:, 0]
-            fd[:, F_Y_AIR_V]  = sv_y2[:, 2]
+            # Phase 2 species — use config-defined SV_Y column mapping
+            for sv_y_col, field_idx in SV_Y_TO_FIELD_P2.items():
+                fd[:, field_idx] = sv_y2[:, sv_y_col]
 
-            # Phase 3 species (2): h2o2 liquid, h2o liquid
-            fd[:, F_Y_H2O2_L] = sv_y3[:, 0]
-            fd[:, F_Y_H2O_L]  = sv_y3[:, 1]
+            # Phase 3 species — use config-defined SV_Y column mapping
+            for sv_y_col, field_idx in SV_Y_TO_FIELD_P3.items():
+                fd[:, field_idx] = sv_y3[:, sv_y_col]
 
             fluid_data_list.append(fd)
             solid_temp_list.append(sv_t_solid.astype(np.float32))

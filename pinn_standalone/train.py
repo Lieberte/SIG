@@ -450,9 +450,30 @@ def main():
     print(f"  T range:     [{data['T_min']:.2f}, {data['T_range'] + data['T_min']:.2f}]K")
 
     train_data, val_data = split_case_data(data, pinn_cfg.val_case_ratio, rng)
-    print(f"  train_cases ({train_data['n_cases']}): {train_data.get('case_names', [])}")
+    train_names = train_data.get('case_names', [])
+    val_names = val_data.get('case_names', []) if val_data else []
+    print(f"  train_cases ({train_data['n_cases']}): {train_names}")
     if val_data:
-        print(f"  val_cases ({val_data['n_cases']}): {val_data.get('case_names', [])}")
+        print(f"  val_cases ({val_data['n_cases']}): {val_names}")
+
+    # Save train/val split info to output dir
+    pinn_cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    split_path = pinn_cfg.output_dir / "train_val_split.txt"
+    with open(split_path, "w", encoding="utf-8") as f:
+        f.write(f"Total cases: {data['n_cases']}\n")
+        f.write(f"val_case_ratio: {pinn_cfg.val_case_ratio}\n")
+        f.write(f"Random seed: 42\n\n")
+        f.write(f"=== Training cases ({len(train_names)}) ===\n")
+        for name in train_names:
+            f.write(f"  {name}\n")
+        f.write(f"\n=== Validation cases ({len(val_names)}) ===\n")
+        for name in val_names:
+            f.write(f"  {name}\n")
+        f.write(f"\nNote: Validation = cross-case generalization test.\n")
+        f.write(f"  The model is trained on the training case(s) and\n")
+        f.write(f"  validated on the held-out case(s) with different\n")
+        f.write(f"  operating conditions (T_preheat, T_h2o2).\n")
+    print(f"  Split info saved to: {split_path}")
 
     # [3] Model
     print("\n[3/7] Creating multi-fluid PINN model...")

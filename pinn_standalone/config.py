@@ -78,6 +78,13 @@ SPECIES_SLICES = {
 # Bulk species index per phase (the last one, for closure ΣY=1)
 BULK_SPECIES = {2: F_Y_AIR_V, 3: F_Y_H2O_L}
 
+# SV_Y column index in Fluent H5 files → config field index
+# Verified against UDF: mass_fraction_h2o2=0.024989, mass_fraction_h2o=0.152936
+# Phase 2 (vapor): SV_Y col 0 = h2o2, col 1 = h2o, col 2 = air(bulk)
+# Phase 3 (liquid): SV_Y col 0 = h2o2<l>, col 1 = h2o<l>(bulk)
+SV_Y_TO_FIELD_P2 = {0: F_Y_H2O2_V, 1: F_Y_H2O_V, 2: F_Y_AIR_V}
+SV_Y_TO_FIELD_P3 = {0: F_Y_H2O2_L, 1: F_Y_H2O_L}
+
 
 @dataclass
 class DataConfig:
