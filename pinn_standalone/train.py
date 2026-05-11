@@ -20,8 +20,8 @@ from pinn_model import PINNModel, PhysicsLoss, InletBCLoss, udf_inlet_temperatur
 from data_loader import (
     load_cas, build_multi_case_training_data, split_case_data, load_inlet_coords,
     make_collocation_points, make_data_points, make_initial_points,
-    make_solid_temp_points, make_inner_surface_temp_points,
-    make_solid_temp_snapshot, make_bc_points,
+    make_solid_temp_points, make_fluid_i_soild_temp_points,
+    make_solid_temp_snapshot, make_fluid_i_soild_temp_snapshot, make_bc_points,
 )
 
 # Field name groups for logging
@@ -110,9 +110,9 @@ class ParametricTrainer:
             fig.add_subplot(2, 2, 4),
         ]
         for ax, vals, title, cmap in [
-            (axes[0], T_true, "Actual solid T (K)", "viridis"),
-            (axes[1], T_pred, "Predicted solid T (K)", "viridis"),
-            (axes[2], T_error, f"Error pred-actual (K), RMSE={rmse:.2f}, MAE={mae:.2f}", "coolwarm"),
+            (axes[0], T_true, "fluid_i-soild — actual T (K)", "viridis"),
+            (axes[1], T_pred, "fluid_i-soild — predicted T (K)", "viridis"),
+            (axes[2], T_error, f"fluid_i-soild error (K), RMSE={rmse:.2f}, MAE={mae:.2f}", "coolwarm"),
         ]:
             contour = ax.scatter(coord[:, 0], coord[:, 1], coord[:, 2], c=vals, s=2, cmap=cmap, alpha=0.85)
             ax.set_title(title); ax.set_xlabel("x_norm"); ax.set_ylabel("y_norm"); ax.set_zlabel("z_norm")
@@ -122,8 +122,10 @@ class ParametricTrainer:
         ax.scatter(T_true, T_pred, s=8, alpha=0.5)
         min_v, max_v = min(T_true.min(), T_pred.min()), max(T_true.max(), T_pred.max())
         ax.plot([min_v, max_v], [min_v, max_v], "r--", linewidth=1)
-        ax.set_title("Predicted vs actual solid T")
+        ax.set_title("fluid_i-soild: Predicted vs actual T")
         ax.set_xlabel("Actual T (K)"); ax.set_ylabel("Predicted T (K)")
+        fig.suptitle(f"Inner Surface T — Epoch {epoch+1} ({len(coord):,} cells, RMSE={rmse:.2f}K, MAE={mae:.2f}K)",
+                     fontsize=14)
         fig.tight_layout()
         out_path = viz_dir / f"epoch_{epoch + 1:05d}.png"
         fig.savefig(out_path, dpi=150)
@@ -543,13 +545,13 @@ def main():
                                 batch_size=pinn_cfg.batch_size, shuffle=True)
     print(f"  initial:     {n_init} points")
 
-    # Solid T — focused on inner surface (sterilization-critical region)
+    # Solid T — focused on fluid_i-soild surface (sterilization-critical region)
     n_solid_pts = pinn_cfg.n_solid_temp_points
-    x_s, t_s, T_s, bc_s = make_inner_surface_temp_points(train_data, n_solid_pts, rng)
+    x_s, t_s, T_s, bc_s = make_fluid_i_soild_temp_points(train_data, n_solid_pts, rng)
     if len(x_s) > 0:
         solid_temp_loader = DataLoader(TensorDataset(x_s, t_s, T_s, bc_s),
                                        batch_size=pinn_cfg.batch_size, shuffle=True)
-        solid_viz_data = make_solid_temp_snapshot(train_data, pinn_cfg.solid_viz_case_idx, pinn_cfg.solid_viz_time_idx)
+        solid_viz_data = make_fluid_i_soild_temp_snapshot(train_data, pinn_cfg.solid_viz_case_idx, pinn_cfg.solid_viz_time_idx)
         print(f"  solid_T:     {n_solid_pts} points (inner-surface focused), "
               f"viz every {pinn_cfg.solid_viz_interval} epochs")
     else:

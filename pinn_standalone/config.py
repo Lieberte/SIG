@@ -165,7 +165,7 @@ class PINNConfig:
     lambda_data: float = 5.0
     lambda_physics_fluid: float = 1.0
     lambda_physics_solid: float = 1.0
-    lambda_solid_temp: float = 10.0  # inner surface T supervision (sterilization-critical)
+    lambda_solid_temp: float = 10.0  # fluid_i-soild T supervision (sterilization-critical)
     lambda_bc_inlet: float = 50.0
     lambda_bc_wall: float = 5.0
     lambda_initial: float = 5.0

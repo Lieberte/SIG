@@ -488,10 +488,22 @@ def build_multi_case_training_data(mesh, data_root: Path, dat_glob: str,
     first = cases[0]
     # Classify solid cells for targeted surface supervision
     solid_classification = classify_solid_cells(mesh, n_solid)
-    print(f"  Solid classification: inner={len(solid_classification['inner_surface']):,}, "
-          f"outer={len(solid_classification['outer_surface']):,}, "
-          f"exterior={len(solid_classification['exterior']):,}, "
+    print(f"  Solid classification: fluid_i_soild={len(solid_classification['fluid_i_soild']):,}, "
+          f"fluid_o_soild={len(solid_classification['fluid_o_soild']):,}, "
+          f"soild_boundary={len(solid_classification['soild_boundary']):,}, "
           f"interior={len(solid_classification['interior']):,}")
+
+    # Pre-compute fluid_i-soild face centers (on the actual interface surface)
+    fluid_i_soild_face_data = compute_fluid_i_soild_face_data(
+        mesh, n_solid, solid_classification, coord_min, coord_range)
+    print(f"  fluid-solid interface faces: {len(fluid_i_soild_face_data['face_to_cell']):,}")
+
+    # Classify fluid cells: near-wall vs core (for balanced sampling)
+    fluid_classification = classify_fluid_cells(mesh, n_fluid)
+    print(f"  Fluid classification: fluid_i={len(fluid_classification['fluid_i']):,} "
+          f"(core={len(fluid_classification['fluid_i_core']):,}, wall={len(fluid_classification['fluid_i_wall']):,}), "
+          f"fluid_o={len(fluid_classification['fluid_o']):,} "
+          f"(core={len(fluid_classification['fluid_o_core']):,}, wall={len(fluid_classification['fluid_o_wall']):,})")
 
     return {
         "cases": cases,
@@ -499,7 +511,9 @@ def build_multi_case_training_data(mesh, data_root: Path, dat_glob: str,
         "cell_centers": cell_centers,
         "fluid_coords": fluid_coords,
         "solid_coords": solid_coords,
-        "solid_classification": solid_classification,  # NEW
+        "solid_classification": solid_classification,
+        "fluid_classification": fluid_classification,  # near-wall vs core
+        "fluid_i_soild_face_data": fluid_i_soild_face_data,  # face centers on interface
         "T_preheat_K": first["T_preheat_K"],
         "T_h2o2_K": first["T_h2o2_K"],
         "norm_coords": norm_fluid_coords,
@@ -534,7 +548,7 @@ def build_multi_case_training_data(mesh, data_root: Path, dat_glob: str,
 import torch  # noqa: E402
 
 
-def get_solid_inner_surface_cells(mesh: dict, n_solid: int) -> np.ndarray:
+def get_fluid_i_soild_cells(mesh: dict, n_solid: int) -> np.ndarray:
     """Identify solid cells adjacent to the inner fluid chamber (fluid_i).
 
     Uses the fluid_i-soild-shadow face zone (zone id=3) to find solid cells
@@ -542,82 +556,209 @@ def get_solid_inner_surface_cells(mesh: dict, n_solid: int) -> np.ndarray:
     for sterilization temperature prediction.
 
     Returns:
-        inner_cells: int32 array of 0-based solid-local cell indices
+        fluid_i_cells: int32 array of 0-based solid-local cell indices
     """
     face_c0 = mesh["face_c0"]
-    with h5py.File(mesh.get("_cas_path", ""), "r") as f:
-        pass  # We use pre-loaded mesh data
-
-    # The mesh dict already has face_c0 loaded. We need to find faces in
-    # the shadow zone (zone 3: fluid_i-soild-shadow, c0=solid cells).
-    # Load zone ranges from mesh dict's zones info
     zones = mesh.get("zones", {})
-    # Look for the shadow zone — face IDs for solid→fluid_i faces
-    # From earlier analysis: shadow zone has faces [88120, 118294]
 
-    # Actually, let's find it dynamically from the zones dict
     target_zone = None
     for name, info in zones.items():
-        if "fluid_i-soild-shadow" in name or name == "fluid_i-soild-shadow":
+        if "fluid_i-soild-shadow" in name:
             target_zone = info
             break
 
     if target_zone is None:
-        # Fallback: hardcoded range from mesh analysis
         face_min, face_max = 88120, 118294
     else:
         face_min, face_max = target_zone["face_min"], target_zone["face_max"]
 
-    inner_cells = set()
-    for fid in range(face_min - 1, face_max):  # 1-based → 0-based
+    fluid_i_cells = set()
+    for fid in range(face_min - 1, face_max):
         c0 = int(face_c0[fid])
         if 0 <= c0 < n_solid:
-            inner_cells.add(c0)
+            fluid_i_cells.add(c0)
 
-    return np.array(sorted(inner_cells), dtype=np.int32)
+    return np.array(sorted(fluid_i_cells), dtype=np.int32)
 
 
 def classify_solid_cells(mesh: dict, n_solid: int) -> dict[str, np.ndarray]:
-    """Classify all solid cells by surface type.
+    """Classify all solid cells by adjacent Fluent zone.
 
-    Returns dict with keys: inner_surface, outer_surface, exterior, interior
-    Each value is a 0-based solid-local index array.
+    Iterates shadow zone faces directly — shadow face_c0 is the solid-local cell index.
+    No offset math needed.
+
+    Returns dict with keys: fluid_i_soild, fluid_o_soild, soild_boundary, interior
     """
     face_c0 = mesh["face_c0"]
     zones = mesh.get("zones", {})
     n_solid_int = int(n_solid)
 
-    inner_surface = set()
-    outer_surface = set()
-    exterior = set()
+    fluid_i_soild = set()
+    fluid_o_soild = set()
+    soild_boundary = set()
 
+    # Shadow zones: face_c0 → solid cell directly
+    shadow_zones = [
+        ("fluid_i-soild-shadow", fluid_i_soild),
+        ("fluid_o-soild-shadow", fluid_o_soild),
+    ]
+
+    for shadow_name, target_set in shadow_zones:
+        info = zones.get(shadow_name)
+        if info is None:
+            continue
+        for fid in range(info["face_min"] - 1, info["face_max"]):
+            c0 = int(face_c0[fid])
+            if 0 <= c0 < n_solid_int:
+                target_set.add(c0)
+
+    # soild:1 zone — boundary faces, c0 = solid cell directly
     for name, info in zones.items():
-        fm, fmax = info["face_min"], info["face_max"]
-        if "fluid_i-soild-shadow" in name:
-            for fid in range(fm - 1, fmax):
+        if name == "soild:1":
+            for fid in range(info["face_min"] - 1, info["face_max"]):
                 c0 = int(face_c0[fid])
                 if 0 <= c0 < n_solid_int:
-                    inner_surface.add(c0)
-        elif "fluid_o-soild-shadow" in name:
-            for fid in range(fm - 1, fmax):
-                c0 = int(face_c0[fid])
-                if 0 <= c0 < n_solid_int:
-                    outer_surface.add(c0)
-        elif "soild:1" == name or name.startswith("soild:"):
-            for fid in range(fm - 1, fmax):
-                c0 = int(face_c0[fid])
-                if 0 <= c0 < n_solid_int:
-                    exterior.add(c0)
+                    soild_boundary.add(c0)
+            break
 
     all_solid = set(range(n_solid_int))
-    all_surface = inner_surface | outer_surface | exterior
+    all_surface = fluid_i_soild | fluid_o_soild | soild_boundary
     interior = all_solid - all_surface
 
     return {
-        "inner_surface": np.array(sorted(inner_surface), dtype=np.int32),
-        "outer_surface": np.array(sorted(outer_surface), dtype=np.int32),
-        "exterior": np.array(sorted(exterior), dtype=np.int32),
+        "fluid_i_soild": np.array(sorted(fluid_i_soild), dtype=np.int32),
+        "fluid_o_soild": np.array(sorted(fluid_o_soild), dtype=np.int32),
+        "soild_boundary": np.array(sorted(soild_boundary), dtype=np.int32),
         "interior": np.array(sorted(interior), dtype=np.int32),
+    }
+
+
+def classify_fluid_cells(mesh: dict, n_fluid: int) -> dict[str, np.ndarray]:
+    """Classify fluid cells by Fluent cell zone: fluid_i, fluid_o.
+
+    Uses interior face c0 to determine which cells belong to which zone.
+    interior--fluid_i faces [2834861, 3732152] → c0 = fluid_i cells
+    interior--fluid_o faces [517851, 2834860] → c0 = fluid_o cells
+
+    Additionally tags near-wall cells via solid interface face zones.
+
+    Returns dict: fluid_i, fluid_o, fluid_i_wall, fluid_o_wall (0-based fluid-local).
+    """
+    face_c0 = mesh["face_c0"]
+    zones = mesh.get("zones", {})
+    n_fluid_int = int(n_fluid)
+
+    fi_all = set()
+    fo_all = set()
+
+    # interior fluid zone faces: c0 identifies owning cell's zone
+    for name in zones:
+        if name == "interior--fluid_i":
+            info = zones[name]
+            for fid in range(info["face_min"] - 1, info["face_max"]):
+                c0 = int(face_c0[fid])
+                if 0 <= c0 < n_fluid_int:
+                    fi_all.add(c0)
+        elif name == "interior--fluid_o":
+            info = zones[name]
+            for fid in range(info["face_min"] - 1, info["face_max"]):
+                c0 = int(face_c0[fid])
+                if 0 <= c0 < n_fluid_int:
+                    fo_all.add(c0)
+        elif name == "fluid_o:1":
+            info = zones[name]
+            for fid in range(info["face_min"] - 1, info["face_max"]):
+                c0 = int(face_c0[fid])
+                if 0 <= c0 < n_fluid_int:
+                    fo_all.add(c0)
+
+    # Solid interface faces: tag wall-adjacent cells per zone
+    fi_wall = set()
+    fo_wall = set()
+    for zone_name in ["fluid_i-soild", "fluid_o-soild"]:
+        info = zones.get(zone_name)
+        if info is None:
+            continue
+        for fid in range(info["face_min"] - 1, info["face_max"]):
+            c0 = int(face_c0[fid])
+            if 0 <= c0 < n_fluid_int:
+                if zone_name == "fluid_i-soild":
+                    fi_wall.add(c0)
+                    fi_all.add(c0)
+                else:
+                    fo_wall.add(c0)
+                    fo_all.add(c0)
+
+    # Core = zone cells NOT adjacent to any wall
+    fi_core = fi_all - fi_wall
+    fo_core = fo_all - fo_wall
+
+    return {
+        "fluid_i": np.array(sorted(fi_all), dtype=np.int32),
+        "fluid_o": np.array(sorted(fo_all), dtype=np.int32),
+        "fluid_i_wall": np.array(sorted(fi_wall), dtype=np.int32),
+        "fluid_o_wall": np.array(sorted(fo_wall), dtype=np.int32),
+        "fluid_i_core": np.array(sorted(fi_core), dtype=np.int32),
+        "fluid_o_core": np.array(sorted(fo_core), dtype=np.int32),
+    }
+
+
+def compute_fluid_i_soild_face_data(mesh: dict, n_solid: int,
+                                    classification: dict,
+                                    coord_min: np.ndarray,
+                                    coord_range: np.ndarray) -> dict:
+    """Compute face centers for the complete fluid-solid interface.
+
+    Combines BOTH fluid_i-soild-shadow AND fluid_o-soild-shadow zones.
+    They are the two sides of the thin solid wall (~0.2 mm thick) and together
+    form the complete fluid-solid interface.
+
+    Returns dict with:
+        norm_face_coords: (n_faces, 3) normalized face centers
+        face_to_cell:     (n_faces,) solid-local cell index per face
+        face_centers_m:   (n_faces, 3) raw face centers in meters
+    """
+    face_c0 = mesh["face_c0"]
+    zones = mesh["zones"]
+    node_coords = mesh["node_coords"]
+    face_nodes = mesh["face_nodes"]
+    offsets = mesh["offsets"]
+    n_solid_int = int(n_solid)
+
+    all_face_centers = []
+    all_face_to_cell = []
+
+    # Both shadow zones contribute to the fluid-solid interface
+    for shadow_name in ["fluid_i-soild-shadow", "fluid_o-soild-shadow"]:
+        shadow_info = zones.get(shadow_name)
+        if shadow_info is None:
+            continue
+
+        fm_shadow = shadow_info["face_min"]
+        n_faces = shadow_info["n_faces"]
+
+        for i in range(n_faces):
+            fid_shadow = (fm_shadow + i) - 1
+            nids = face_nodes[offsets[fid_shadow]:offsets[fid_shadow + 1]]
+            c = node_coords[nids - 1].mean(axis=0)
+            c0 = int(face_c0[fid_shadow])
+            if 0 <= c0 < n_solid_int:
+                all_face_centers.append(c)
+                all_face_to_cell.append(c0)
+
+    if not all_face_centers:
+        return {"norm_face_coords": np.zeros((0, 3), dtype=np.float32),
+                "face_to_cell": np.zeros(0, dtype=np.int32),
+                "face_centers_m": np.zeros((0, 3), dtype=np.float64)}
+
+    face_centers = np.array(all_face_centers, dtype=np.float64)
+    face_to_cell = np.array(all_face_to_cell, dtype=np.int32)
+    norm_face_coords = ((face_centers - coord_min) / coord_range).astype(np.float32)
+
+    return {
+        "norm_face_coords": norm_face_coords,
+        "face_to_cell": face_to_cell,
+        "face_centers_m": face_centers,
     }
 
 
@@ -635,7 +776,26 @@ def make_collocation_points(data: dict, n_points: int, rng,
     coords_all = data["norm_coords_all"]
     solid_mask_all = data["solid_mask_all"]
     n_total = len(coords_all)
-    cell_idx = rng.integers(0, n_total, size=n_points)
+    n_fluid = data["n_fluid"]
+    fluid_cls = data.get("fluid_classification", {})
+
+    fi_core = fluid_cls.get("fluid_i_core", None)
+
+    if fi_core is not None and len(fi_core) > 0:
+        # 30% fluid_i_core (center), 20% all fluid, 50% all cells
+        n_fi_core = int(n_points * 0.30)
+        n_fl = int(n_points * 0.20)
+        n_all = n_points - n_fi_core - n_fl
+
+        cell_idx = np.concatenate([
+            rng.choice(fi_core, size=n_fi_core, replace=True),
+            rng.integers(0, n_fluid, size=n_fl) if n_fl > 0 else np.array([], dtype=np.int64),
+            rng.integers(0, n_total, size=n_all),
+        ])
+        rng.shuffle(cell_idx)
+    else:
+        cell_idx = rng.integers(0, n_total, size=n_points)
+
     case_idx = _sample_cases(data, n_points, rng)
     x = coords_all[cell_idx].copy()
     solid_mask = solid_mask_all[cell_idx].copy()
@@ -669,9 +829,32 @@ def make_collocation_points(data: dict, n_points: int, rng,
 
 
 def make_data_points(data: dict, n_points: int, rng) -> tuple:
-    """Sample fluid data points — returns 20-field targets."""
+    """Sample fluid data points — weighted toward fluid_i core (center region)."""
     n_fluid = data["n_fluid"]
-    cell_idx = rng.integers(0, n_fluid, size=n_points)
+    fluid_cls = data.get("fluid_classification", {})
+
+    fi_core = fluid_cls.get("fluid_i_core", None)
+    fi_wall = fluid_cls.get("fluid_i_wall", None)
+    fo_cells = fluid_cls.get("fluid_o", None)
+
+    if fi_core is not None and len(fi_core) > 0:
+        n_fi_core = int(n_points * 0.40)
+        n_fi_wall = int(n_points * 0.20)
+        n_fo = int(n_points * 0.25)
+        n_random = n_points - n_fi_core - n_fi_wall - n_fo
+
+        parts = [rng.choice(fi_core, size=n_fi_core, replace=True),
+                 rng.choice(fi_wall, size=n_fi_wall, replace=True)]
+        if len(fo_cells) > 0:
+            parts.append(rng.choice(fo_cells, size=n_fo, replace=True))
+        else:
+            parts.append(rng.integers(0, n_fluid, size=n_fo))
+        parts.append(rng.integers(0, n_fluid, size=n_random))
+        cell_idx = np.concatenate(parts)
+        rng.shuffle(cell_idx)
+    else:
+        cell_idx = rng.integers(0, n_fluid, size=n_points)
+
     case_idx = _sample_cases(data, n_points, rng)
     x = data["norm_coords"][cell_idx]
     t = np.zeros((n_points, 1), dtype=np.float32)
@@ -812,43 +995,105 @@ def make_solid_temp_snapshot(data: dict, case_idx: int = 0, time_idx: int = -1) 
             torch.from_numpy(bc_params).float())
 
 
-def make_inner_surface_temp_points(data: dict, n_points: int, rng) -> tuple:
-    """Generate solid temperature supervision points focused on the inner surface.
+def make_fluid_i_soild_temp_snapshot(data: dict, case_idx: int = 0, time_idx: int = -1) -> tuple:
+    """Full-resolution snapshot of fluid_i-soild interface — face centers (ON the surface)."""
+    n_solid = data["n_solid"]
+    if n_solid == 0:
+        return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
 
-    Samples preferentially from inner surface cells (the sterilization-critical region).
-    Falls back to uniform sampling if no classification data is available.
+    face_data = data.get("fluid_i_soild_face_data", {})
+    face_coords = face_data.get("norm_face_coords", None)
+    face_to_cell = face_data.get("face_to_cell", None)
+
+    if face_coords is not None and len(face_coords) > 0:
+        x = face_coords
+        cell_idx = face_to_cell
+    else:
+        # Fallback to cell centers
+        classification = data.get("solid_classification", {})
+        fluid_i_cells = classification.get("fluid_i_soild",
+                        np.arange(n_solid, dtype=np.int32))
+        x = data["norm_coords_all"][data["n_fluid"] + fluid_i_cells]
+        cell_idx = fluid_i_cells
+
+    n_pts = len(x)
+
+    if "cases" in data:
+        case_idx = int(np.clip(case_idx, 0, len(data["cases"]) - 1))
+        case = data["cases"][case_idx]
+        if len(case["norm_solid_T"]) == 0:
+            return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
+        time_idx = time_idx % case["n_time"]
+        t_value = case["norm_times"][time_idx]
+        v_T = np.array(case["norm_solid_T"])[time_idx][cell_idx].reshape(-1, 1)
+        bc_params = _case_params(case, n_pts)
+    else:
+        if len(data["norm_solid_T"]) == 0:
+            return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
+        time_idx = time_idx % data["n_time"]
+        t_value = data["norm_times"][time_idx]
+        v_T = np.array(data["norm_solid_T"])[time_idx][cell_idx].reshape(-1, 1)
+        bc_params = np.repeat(np.array([[
+            (data["T_preheat_K"] - data["T_min"]) / data["T_range"],
+            (data["T_h2o2_K"] - data["T_min"]) / data["T_range"],
+        ]], dtype=np.float32), n_pts, axis=0)
+    t = np.full((n_pts, 1), t_value, dtype=np.float32)
+    return (torch.from_numpy(x).float(),
+            torch.from_numpy(t).float(),
+            torch.from_numpy(v_T.astype(np.float32)).float(),
+            torch.from_numpy(bc_params).float())
+
+
+def make_fluid_i_soild_temp_points(data: dict, n_points: int, rng) -> tuple:
+    """Generate solid temperature supervision points on the fluid-solid interface.
+
+    Samples 80% from combined face centers (fluid_i-soild + fluid_o-soild shadow zones
+    = both sides of the thin solid wall, together forming the complete interface).
+    20% from random solid cells for interior coverage.
+
+    Face→cell mapping provides the owner cell's temperature as ground truth.
     """
     n_solid = data["n_solid"]
     if n_solid == 0:
         return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
 
-    classification = data.get("solid_classification", {})
-    inner_cells = classification.get("inner_surface", None)
+    face_data = data.get("fluid_i_soild_face_data", {})
+    face_coords = face_data.get("norm_face_coords", None)
+    face_to_cell = face_data.get("face_to_cell", None)
 
-    if inner_cells is not None and len(inner_cells) > 0:
-        # 70% inner surface, 20% outer surface, 10% rest
-        n_inner = int(n_points * 0.7)
-        n_outer = int(n_points * 0.2)
-        n_random = n_points - n_inner - n_outer
+    if face_coords is not None and len(face_coords) > 0:
+        n_faces = len(face_coords)
+        n_face_pts = int(n_points * 0.8)
+        n_random = n_points - n_face_pts
 
-        outer_cells = classification.get("outer_surface",
-                       np.array([], dtype=np.int32))
-        all_cells = np.arange(n_solid, dtype=np.int32)
+        # 80% from interface faces (both fluid_i + fluid_o combined)
+        face_idx = rng.choice(n_faces, size=n_face_pts, replace=True)
 
-        inner_idx = rng.choice(inner_cells, size=n_inner, replace=True)
-        outer_idx = (rng.choice(outer_cells, size=n_outer, replace=True)
-                     if len(outer_cells) > 0 and n_outer > 0
-                     else np.array([], dtype=np.int32))
-        random_idx = rng.choice(all_cells, size=n_random, replace=True)
+        # 20% random solid cells for interior coverage
+        random_cell_idx = rng.integers(0, n_solid, size=n_random)
 
-        cell_idx = np.concatenate([inner_idx, outer_idx, random_idx])
-        rng.shuffle(cell_idx)
+        # Coordinates: face centers for interface samples, cell centers for interior
+        x = np.zeros((n_points, 3), dtype=np.float32)
+        x[:n_face_pts] = face_coords[face_idx]
+        for i, cid in enumerate(random_cell_idx):
+            x[n_face_pts + i] = data["norm_coords_all"][data["n_fluid"] + cid]
+
+        # Cell index for temperature lookup:
+        # face samples → owner cell; interior samples → self
+        cell_idx = np.zeros(n_points, dtype=np.int32)
+        cell_idx[:n_face_pts] = face_to_cell[face_idx]
+        cell_idx[n_face_pts:] = random_cell_idx
+
+        # Shuffle so face/cell samples are interleaved
+        perm = rng.permutation(n_points)
+        x = x[perm]
+        cell_idx = cell_idx[perm]
     else:
+        # Fallback: uniform cell sampling
         cell_idx = rng.integers(0, n_solid, size=n_points)
+        x = data["norm_coords_all"][data["n_fluid"] + cell_idx]
 
     case_idx = _sample_cases(data, n_points, rng)
-    coord_idx = data["n_fluid"] + cell_idx
-    x = data["norm_coords_all"][coord_idx]
     t = np.zeros((n_points, 1), dtype=np.float32)
     v_T = np.zeros((n_points, 1), dtype=np.float32)
     bc_params = np.zeros((n_points, 2), dtype=np.float32)

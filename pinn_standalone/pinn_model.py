@@ -222,36 +222,27 @@ class PhysicsLoss:
         self.kScale  = self._safeScale(self.rho[1] / T_abs)
         self.wScale  = self._safeScale(self.rho[1] / T_abs)
 
-    # ── derivative helpers ────────────────────────────────
+    # ── derivative helpers (cached — each field's grad computed once) ──
 
-    def _d1(self, u: torch.Tensor, x: torch.Tensor, idx: int) -> torch.Tensor:
+    def _grad_spatial(self, u: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute (du/dx, du/dy, du/dz) scaled, in a single grad() call."""
         du = grad(u, x, torch.ones_like(u), create_graph=True, retain_graph=True)[0]
-        scale = [self.hx, self.hy, self.hz][idx]
-        return du[:, idx:idx + 1] * scale
+        return (du[:, 0:1] * self.hx, du[:, 1:2] * self.hy, du[:, 2:3] * self.hz)
 
-    def _d1t(self, u: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def _grad_time(self, u: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         return grad(u, t, torch.ones_like(u), create_graph=True, retain_graph=True)[0] * self.ht
 
-    def _d2(self, u: torch.Tensor, x: torch.Tensor, idx: int) -> torch.Tensor:
-        du = grad(u, x, torch.ones_like(u), create_graph=True, retain_graph=True)[0]
-        du_i = du[:, idx:idx + 1]
-        d2u = grad(du_i, x, torch.ones_like(du_i), create_graph=True, retain_graph=True)[0]
-        scale = [self.hxx, self.hyy, self.hzz][idx]
-        return d2u[:, idx:idx + 1] * scale
-
-    def _laplacian(self, u: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return self._d2(u, x, 0) + self._d2(u, x, 1) + self._d2(u, x, 2)
-
-    def _advect(self, u: torch.Tensor, phi: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return u * self._d1(phi, x, 0) + self._d1(phi, x, 1) + self._d1(phi, x, 2)
-
-    # ── per-phase velocity extraction ─────────────────────
-
-    def _vel(self, out: torch.Tensor, phase: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if phase == 1: u, v, w = F_U1, F_V1, F_W1
-        elif phase == 2: u, v, w = F_U2, F_V2, F_W2
-        else: u, v, w = F_U3, F_V3, F_W3
-        return out[:, u:u + 1], out[:, v:v + 1], out[:, w:w + 1]
+    def _laplacian_from_grads(
+        self,
+        gx: torch.Tensor, gy: torch.Tensor, gz: torch.Tensor,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Laplacian = d²/dx² + d²/dy² + d²/dz², given cached first derivatives."""
+        ones = torch.ones_like(gx)
+        gxx = grad(gx, x, ones, create_graph=True, retain_graph=True)[0][:, 0:1] * self.hx
+        gyy = grad(gy, x, ones, create_graph=True, retain_graph=True)[0][:, 1:2] * self.hy
+        gzz = grad(gz, x, ones, create_graph=True, retain_graph=True)[0][:, 2:3] * self.hz
+        return gxx + gyy + gzz
 
     # ── main compute ──────────────────────────────────────
 
@@ -262,8 +253,7 @@ class PhysicsLoss:
         out: torch.Tensor,
         solid_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Compute all PDE residuals. Returns dict of name → residual."""
-        # Denormalize output for physical computation
+        """Compute all PDE residuals. Each field's gradient computed once, shared."""
         if self.field_mean is not None and self.field_std is not None:
             fm = self.field_mean.to(out.device)
             fs = self.field_std.to(out.device)
@@ -271,105 +261,128 @@ class PhysicsLoss:
         else:
             out_phys = out
 
+        # ── extract fields ──
+        u1, v1, w1 = out_phys[:, F_U1:F_U1+1], out_phys[:, F_V1:F_V1+1], out_phys[:, F_W1:F_W1+1]
+        u2, v2, w2 = out_phys[:, F_U2:F_U2+1], out_phys[:, F_V2:F_V2+1], out_phys[:, F_W2:F_W2+1]
+        u3, v3, w3 = out_phys[:, F_U3:F_U3+1], out_phys[:, F_V3:F_V3+1], out_phys[:, F_W3:F_W3+1]
+        p   = out_phys[:, F_P:F_P+1]
+        T   = out_phys[:, F_T:F_T+1]
+        kf  = out_phys[:, F_K:F_K+1]
+        wf  = out_phys[:, F_OMEGA:F_OMEGA+1]
+        vof2 = out_phys[:, F_VOF2:F_VOF2+1]
+        Y_h2o2_v = out_phys[:, F_Y_H2O2_V:F_Y_H2O2_V+1]
+        Y_h2o_v  = out_phys[:, F_Y_H2O_V:F_Y_H2O_V+1]
+        Y_h2o2_l = out_phys[:, F_Y_H2O2_L:F_Y_H2O2_L+1]
+
+        # ── cache: pre-compute every field's spatial gradient once ──
+        g = {}  # g['u1'] = (du1_dx, du1_dy, du1_dz)  etc.
+        fields_spatial = {
+            'u1':u1,'v1':v1,'w1':w1, 'u2':u2,'v2':v2,'w2':w2, 'u3':u3,'v3':v3,'w3':w3,
+            'p':p, 'T':T, 'k':kf, 'omega':wf, 'vof2':vof2,
+            'Y_h2o2_v':Y_h2o2_v, 'Y_h2o_v':Y_h2o_v, 'Y_h2o2_l':Y_h2o2_l,
+        }
+        for name, field in fields_spatial.items():
+            g[name] = self._grad_spatial(field, x)
+
+        # ── cache: time derivatives (only fields that appear in unsteady PDEs) ──
+        gt = {}  # gt['u1'] = du1_dt  etc.
+        fields_temporal = [
+            'u1','v1','w1','u2','v2','w2','u3','v3','w3',
+            'T','k','omega','vof2','Y_h2o2_v','Y_h2o_v','Y_h2o2_l',
+        ]
+        field_map_t = {n: fields_spatial[n] for n in fields_temporal}
+        for name, field in field_map_t.items():
+            gt[name] = self._grad_time(field, t)
+
+        # ── cache: laplacians (only fields that need one) ──
+        lap = {}  # lap['u1'] = ∇²u1
+        laplacian_fields = [
+            'u1','v1','w1','u2','v2','w2','u3','v3','w3',
+            'T','k','omega','Y_h2o2_v','Y_h2o_v','Y_h2o2_l',
+        ]
+        for name in laplacian_fields:
+            gx, gy, gz = g[name]
+            lap[name] = self._laplacian_from_grads(gx, gy, gz, x)
+
         res = {}
 
-        # ── Phase 1 velocity ──
-        u1, v1, w1 = self._vel(out_phys, 1)
-        # ── Phase 2 velocity ──
-        u2, v2, w2 = self._vel(out_phys, 2)
-        # ── Phase 3 velocity ──
-        u3, v3, w3 = self._vel(out_phys, 3)
-
-        p  = out_phys[:, F_P:F_P + 1]
-        T  = out_phys[:, F_T:F_T + 1]
-        k_field  = out_phys[:, F_K:F_K + 1]
-        w_field  = out_phys[:, F_OMEGA:F_OMEGA + 1]
-        vof2 = out_phys[:, F_VOF2:F_VOF2 + 1]
-        vof3 = out_phys[:, F_VOF3:F_VOF3 + 1]
-
-        # ── Phase 1 momentum + continuity ──
+        # ── continuity (phase 1) ──
         if "continuity" in self.enabled:
-            lap_u1 = self._laplacian(u1, x)
-            lap_v1 = self._laplacian(v1, x)
-            lap_w1 = self._laplacian(w1, x)
-            dudx = self._d1(u1, x, 0); dvdy = self._d1(v1, x, 1); dwdz = self._d1(w1, x, 2)
+            dudx, _, _ = g['u1']; _, dvdy, _ = g['v1']; _, _, dwdz = g['w1']
             res["continuity"] = (dudx + dvdy + dwdz) / self.contScale
 
-        for name, u, v, w, rho_p, mu_p, en in [
-            ("momentum_p1", u1, v1, w1, self.rho[1], self.mu[1], "momentum_p1"),
-            ("momentum_p2", u2, v2, w2, self.rho[2], self.mu[2], "momentum_p2"),
-            ("momentum_p3", u3, v3, w3, self.rho[3], self.mu[3], "momentum_p3"),
+        # ── momentum (3 phases × 3 components) ──
+        for prefix, phase, u, v, w, rho_p, mu_p, ms in [
+            ("momentum_p1", 1, u1, v1, w1, self.rho[1], self.mu[1], self.momScale1),
+            ("momentum_p2", 2, u2, v2, w2, self.rho[2], self.mu[2], self.momScale2),
+            ("momentum_p3", 3, u3, v3, w3, self.rho[3], self.mu[3], self.momScale3),
         ]:
-            ms = {"momentum_p1": self.momScale1, "momentum_p2": self.momScale2, "momentum_p3": self.momScale3}[en]
-            for ax, vel, label in [
-                ("x", u, f"{name}_x"), ("y", v, f"{name}_y"), ("z", w, f"{name}_z")
+            n_u, n_v, n_w = f'u{phase}', f'v{phase}', f'w{phase}'
+            ux, uy, uz = g[n_u]; vx, vy, vz = g[n_v]; wx, wy, wz = g[n_w]
+            px, py, pz = g['p']
+
+            for ax, vel, vel_name, label in [
+                ("x", u, n_u, f"{prefix}_x"),
+                ("y", v, n_v, f"{prefix}_y"),
+                ("z", w, n_w, f"{prefix}_z"),
             ]:
                 if label not in self.enabled:
                     continue
-                lap = self._laplacian(vel, x)
-                dveldt = self._d1t(vel, t)
-                adv = self._advect(u, vel, x) + self._advect(v, vel, x) + self._advect(w, vel, x)
-                dp = self._d1(p, x, 0) if ax == "x" else self._d1(p, x, 1) if ax == "y" else self._d1(p, x, 2)
-                res[label] = (rho_p * (dveldt + adv) + dp - mu_p * lap) / ms
+                dveldt = gt[vel_name]
+                vel_dx, vel_dy, vel_dz = g[vel_name]
+                adv = u * vel_dx + v * vel_dy + w * vel_dz
+                dp = px if ax == "x" else (py if ax == "y" else pz)
+                res[label] = (rho_p * (dveldt + adv) + dp - mu_p * lap[vel_name]) / ms
 
-        # ── Phase energy equations ──
-        for label_name, vel_u, vel_v, vel_w, rho_p, cp_p, k_p, en_s in [
+        # ── energy (phase 2, phase 3, solid) ──
+        dTdt = gt['T']; Tx, Ty, Tz = g['T']; lap_T = lap['T']
+        for label, vel_u, vel_v, vel_w, rho_p, cp_p, k_p, en_s in [
             ("energy_p2", u2, v2, w2, self.rho[2], self.cp[2], self.k[2], self.enScale2),
             ("energy_p3", u3, v3, w3, self.rho[3], self.cp[3], self.k[3], self.enScale3),
         ]:
-            if label_name not in self.enabled:
+            if label not in self.enabled:
                 continue
-            dTdt = self._d1t(T, t)
-            adv_T = self._advect(vel_u, T, x) + self._advect(vel_v, T, x) + self._advect(vel_w, T, x)
-            lap_T = self._laplacian(T, x)
-            res[label_name] = (rho_p * cp_p * (dTdt + adv_T) - k_p * lap_T) / en_s
+            adv_T = vel_u * Tx + vel_v * Ty + vel_w * Tz
+            res[label] = (rho_p * cp_p * (dTdt + adv_T) - k_p * lap_T) / en_s
 
-        # ── Solid energy ──
         if "energy_solid" in self.enabled:
-            dTdt = self._d1t(T, t)
-            lap_T = self._laplacian(T, x)
             res["energy_solid"] = (self.rho_s * self.cp_s * dTdt - self.k_s * lap_T) / self.enSolidS
 
-        # ── Species transport (Phase 2 — vapor) ──
-        Y_h2o2_v = out_phys[:, F_Y_H2O2_V:F_Y_H2O2_V + 1]
-        Y_h2o_v  = out_phys[:, F_Y_H2O_V:F_Y_H2O_V + 1]
-        for label_name, Y, D in [
-            ("species_h2o2_v", Y_h2o2_v, self.D_v["h2o2"]),
-            ("species_h2o_v",  Y_h2o_v,  self.D_v["h2o"]),
+        # ── species transport (phase 2 vapor) ──
+        for label, Y, Y_name, D in [
+            ("species_h2o2_v", Y_h2o2_v, 'Y_h2o2_v', self.D_v["h2o2"]),
+            ("species_h2o_v",  Y_h2o_v,  'Y_h2o_v',  self.D_v["h2o"]),
         ]:
-            if label_name not in self.enabled:
+            if label not in self.enabled:
                 continue
-            dYdt = self._d1t(Y, t)
-            adv_Y = self._advect(u2, Y, x) + self._advect(v2, Y, x) + self._advect(w2, Y, x)
-            lap_Y = self._laplacian(Y, x)
-            res[label_name] = (self.rho[2] * (dYdt + adv_Y) - self.rho[2] * D * lap_Y) / self.spScale2
+            Yx, Yy, Yz = g[Y_name]
+            adv_Y = u2 * Yx + v2 * Yy + w2 * Yz
+            res[label] = (self.rho[2] * (gt[Y_name] + adv_Y) - self.rho[2] * D * lap[Y_name]) / self.spScale2
 
-        # ── Species transport (Phase 3 — liquid) ──
-        Y_h2o2_l = out_phys[:, F_Y_H2O2_L:F_Y_H2O2_L + 1]
+        # ── species transport (phase 3 liquid) ──
         if "species_h2o2_l" in self.enabled:
-            dYdt = self._d1t(Y_h2o2_l, t)
-            adv_Y = self._advect(u3, Y_h2o2_l, x) + self._advect(v3, Y_h2o2_l, x) + self._advect(w3, Y_h2o2_l, x)
-            lap_Y = self._laplacian(Y_h2o2_l, x)
-            res["species_h2o2_l"] = (self.rho[3] * (dYdt + adv_Y) - self.rho[3] * self.D_l["h2o2"] * lap_Y) / self.spScale3
+            Ylx, Yly, Ylz = g['Y_h2o2_l']
+            adv_Yl = u3 * Ylx + v3 * Yly + w3 * Ylz
+            res["species_h2o2_l"] = (
+                self.rho[3] * (gt['Y_h2o2_l'] + adv_Yl) - self.rho[3] * self.D_l["h2o2"] * lap['Y_h2o2_l']
+            ) / self.spScale3
 
         # ── VOF advection ──
         if "vof_advection" in self.enabled:
-            dvof2dt = self._d1t(vof2, t)
-            adv_vof2 = self._advect(u2, vof2, x) + self._advect(v2, vof2, x) + self._advect(w2, vof2, x)
-            res["vof_advection"] = dvof2dt + adv_vof2  # dimensionless, no scaling needed
+            vof_x, vof_y, vof_z = g['vof2']
+            adv_vof = u2 * vof_x + v2 * vof_y + w2 * vof_z
+            res["vof_advection"] = gt['vof2'] + adv_vof
 
-        # ── k-ω turbulence (simplified — modelled as transport) ──
+        # ── k-ω turbulence ──
         if "k_transport" in self.enabled:
-            dkdt = self._d1t(k_field, t)
-            adv_k = self._advect(u1, k_field, x) + self._advect(v1, k_field, x) + self._advect(w1, k_field, x)
-            lap_k = self._laplacian(k_field, x)
-            res["k_transport"] = (self.rho[1] * (dkdt + adv_k) - (self.mu[1] + self.mu[1] * 10) * lap_k) / self.kScale
+            kx, ky, kz = g['k']
+            adv_k = u1 * kx + v1 * ky + w1 * kz
+            res["k_transport"] = (self.rho[1] * (gt['k'] + adv_k) - (self.mu[1] + self.mu[1] * 10) * lap['k']) / self.kScale
 
         if "omega_transport" in self.enabled:
-            dwdt = self._d1t(w_field, t)
-            adv_w = self._advect(u1, w_field, x) + self._advect(v1, w_field, x) + self._advect(w1, w_field, x)
-            lap_w = self._laplacian(w_field, x)
-            res["omega_transport"] = (self.rho[1] * (dwdt + adv_w) - (self.mu[1] + self.mu[1] * 10) * lap_w) / self.wScale
+            wx_o, wy_o, wz_o = g['omega']
+            adv_w = u1 * wx_o + v1 * wy_o + w1 * wz_o
+            res["omega_transport"] = (self.rho[1] * (gt['omega'] + adv_w) - (self.mu[1] + self.mu[1] * 10) * lap['omega']) / self.wScale
 
         return res
 
