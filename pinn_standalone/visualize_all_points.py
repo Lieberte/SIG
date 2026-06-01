@@ -33,8 +33,8 @@ else:
     n_solid = 64503
 print(f"  fluid={n_fluid:,}  solid={n_solid:,}  total={n_fluid + n_solid:,}  all_centers={cell_centers_all.shape[0]:,}")
 
-fluid_coords = cell_centers_all[:n_fluid]
-solid_coords = cell_centers_all[n_fluid:n_fluid + n_solid]
+fluid_coords = cell_centers_all[n_solid + 1 : n_solid + 1 + n_fluid]
+solid_coords = cell_centers_all[1 : n_solid + 1]
 
 # Filter out cells with [0,0,0] coords (invalid / no nodes)
 solid_valid_mask = (np.abs(solid_coords).max(axis=1) > 1e-10)
@@ -83,12 +83,16 @@ face_to_cell_remapped = np.array([old_to_new[c] if 0 <= c < n_solid else -1 for 
 ss = max(1, len(fluid_coords) // 100000)
 fluid_viz = fluid_coords[::ss]
 # Labels: 0=other, 1=fluid_i_core, 2=fluid_i_wall, 3=fluid_o_core, 4=fluid_o_wall
-fluid_cls = classify_fluid_cells(mesh, n_fluid)
+fluid_cls = classify_fluid_cells(mesh, n_fluid, n_solid)
 fluid_labels = np.zeros(n_fluid, dtype=np.int32)
 fluid_labels[fluid_cls["fluid_o_core"]] = 3
 fluid_labels[fluid_cls["fluid_o_wall"]] = 4
 fluid_labels[fluid_cls["fluid_i_core"]] = 1
 fluid_labels[fluid_cls["fluid_i_wall"]] = 2  # highest priority (wall overlay)
+
+print(f"  Fluid zones: fluid_i={len(fluid_cls['fluid_i']):,} (core={len(fluid_cls['fluid_i_core']):,}, wall={len(fluid_cls['fluid_i_wall']):,}), "
+      f"fluid_o={len(fluid_cls['fluid_o']):,} (core={len(fluid_cls['fluid_o_core']):,}, wall={len(fluid_cls['fluid_o_wall']):,})")
+print(f"  Other/unclassified: {(fluid_labels == 0).sum():,}")
 
 vtk_fluid = OUT_DIR / "all_fluid_cells.vtk"
 with open(vtk_fluid, "w", encoding="utf-8") as f:

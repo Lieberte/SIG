@@ -38,7 +38,7 @@ classification = classify_solid_cells(mesh, n_solid)
 for key in ["fluid_i_soild", "fluid_o_soild", "soild_boundary", "interior"]:
     print(f"  {key}: {len(classification[key]):,}")
 
-solid_centers_all = cell_centers_all[n_fluid:n_fluid + n_solid]
+solid_centers_all = cell_centers_all[1:n_solid + 1]
 
 # Filter invalid [0,0,0] cells
 solid_valid = (np.abs(solid_centers_all).max(axis=1) > 1e-10)
@@ -51,8 +51,8 @@ else:
     old_to_new = np.arange(n_solid, dtype=np.int32)
 
 # Compute combined face data (fluid_i + fluid_o shadow zones)
-coord_min = cell_centers_all[:n_fluid].min(axis=0)
-coord_max = cell_centers_all[:n_fluid].max(axis=0)
+coord_min = cell_centers_all[n_solid + 1 : n_solid + 1 + n_fluid].min(axis=0)
+coord_max = cell_centers_all[n_solid + 1 : n_solid + 1 + n_fluid].max(axis=0)
 coord_range = coord_max - coord_min + 1e-12
 
 face_data = compute_fluid_i_soild_face_data(mesh, n_solid, classification, coord_min, coord_range)

@@ -1,0 +1,34 @@
+%% 若子图内仍是竖排：① 下面第一行 ELK 在 Mermaid Live 10.4+ 常能修复；② 飞书不支持 %%{init} 时用 main_flow_compact.mmd；③ 最稳：main_flow_split.mmd 四段分别粘贴
+%%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%
+flowchart TB
+  subgraph R1["① 数据与工况准备"]
+    direction LR
+    r1a["读网格·单元中心"] --> r1b["读快照·二十维场与固体温"]
+    r1b --> r1c["解析工况入口温度"]
+    r1c --> r1d["多工况归一化·时间表"]
+    r1d --> r1e["内外流体·固体邻域·界面"]
+  end
+
+  subgraph R2["② 划分与采样"]
+    direction LR
+    r2a["按工况划分训练/验证"] --> r2b["配点·数据·初值·固体·入口"]
+    r2b --> r2c["每样本带工况参数"]
+  end
+
+  subgraph R3["③ 模型与损失"]
+    direction LR
+    r3a["网络输出二十维"] --> r3b["可行域·入口硬约束"]
+    r3b --> r3c["物理残差无量纲加权"]
+    r3c --> r3d["数据·固体·初值·软守恒"]
+  end
+
+  subgraph R4["④ 训练与产出"]
+    direction LR
+    r4a["多损失联合优化"] --> r4b["入口可动态采样时刻"]
+    r4b --> r4c["验证·固体可视化"]
+    r4c --> r4d["保存模型与记录"]
+  end
+
+  r1e --> r2a
+  r2c --> r3a
+  r3d --> r4a

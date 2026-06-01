@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
 import torch
+from torch.autograd import grad
 from torch.utils.data import DataLoader, TensorDataset
 
 from config import (DataConfig, PINNConfig, FIELD_NAMES, N_OUTPUT_FIELDS,
@@ -88,7 +89,7 @@ class ParametricTrainer:
         except ModuleNotFoundError:
             return
         _ = Axes3D
-        x_solid, t_solid, T_solid, bc_solid = solid_viz_data
+        x_solid, t_solid, T_solid, _, bc_solid = solid_viz_data
         if len(x_solid) == 0:
             return
         self.model.eval()
@@ -143,7 +144,7 @@ class ParametricTrainer:
                 for i, name in enumerate(ALL_FIELD_NAMES):
                     metrics[f"val_data_{name}"].append(field_mse[i].item())
             if val_solid_loader is not None:
-                for x_solid, t_solid, T_solid, bc_solid in val_solid_loader:
+                for x_solid, t_solid, T_solid, _, bc_solid in val_solid_loader:
                     pred = self.model(x_solid.to(self.device), t_solid.to(self.device), bc_solid.to(self.device))
                     target = T_solid.to(self.device)
                     metrics["val_loss_solid_temp"].append(((pred[:, F_T:F_T + 1] - target) ** 2).mean().item())
@@ -155,7 +156,7 @@ class ParametricTrainer:
         x_dat, t_dat, v_dat, bc_dat,
         t_bc, bc_bc, T_bc_a, T_bc_b,
         x_init, v_init, bc_init,
-        x_solid, t_solid, T_solid_target, bc_solid,
+        x_solid, t_solid, T_solid_target, grad_T_solid, bc_solid,
         solid_mask,
         lambda_physics: float = 0.1,
         lambda_bc: float = 10.0,
@@ -221,6 +222,19 @@ class ParametricTrainer:
             solid_T_loss = ((T_pred - T_solid_target) ** 2).mean()
             loss += self.cfg.lambda_solid_temp * solid_T_loss
             metrics['loss_solid_temp'] = solid_T_loss.item()
+
+            # ── 3b. Solid temperature spatial gradient supervision ──
+            if grad_T_solid is not None and grad_T_solid.abs().sum() > 0:
+                x_s = x_solid.detach().clone().requires_grad_(True)
+                pred_s = self.model(x_s, t_solid, bc_solid)
+                T_s = pred_s[:, F_T:F_T + 1]
+                dT = grad(T_s, x_s, torch.ones_like(T_s),
+                          create_graph=True, retain_graph=True)[0]
+                # dT: [N, 3] — predicted gradient in normalized coords
+                # grad_T_solid: [N, 3] — CFD gradient in normalized coords
+                grad_loss = ((dT - grad_T_solid) ** 2).mean()
+                loss += self.cfg.lambda_solid_grad * grad_loss
+                metrics['loss_solid_grad'] = grad_loss.item()
 
         # ── 4. Inlet BC loss ──
         if t_bc is not None and self.globalStep % self.cfg.bc_loss_interval == 0:
@@ -309,7 +323,7 @@ class ParametricTrainer:
                     t_bc = bc_bc = T_bc_a = T_bc_b = None
 
                 x_init, v_init, bc_init = all_init[i % n_init] if n_init > 0 else (None, None, None)
-                x_solid, t_solid, T_solid, bc_solid = all_solid[i % n_solid] if n_solid > 0 else (None, None, None, None)
+                x_solid, t_solid, T_solid, grad_T_solid, bc_solid = all_solid[i % n_solid] if n_solid > 0 else (None, None, None, None, None)
 
                 loss_val, metrics = self.train_step(
                     x_col.to(self.device) if x_col is not None else None,
@@ -329,6 +343,7 @@ class ParametricTrainer:
                     x_solid.to(self.device) if x_solid is not None else None,
                     t_solid.to(self.device) if t_solid is not None else None,
                     T_solid.to(self.device) if T_solid is not None else None,
+                    grad_T_solid.to(self.device) if grad_T_solid is not None else None,
                     bc_solid.to(self.device) if bc_solid is not None else None,
                     mask_col.to(self.device) if mask_col is not None else None,
                     lambda_physics=self.cfg.lambda_physics_fluid,
@@ -377,6 +392,8 @@ class ParametricTrainer:
 
                 if 'loss_solid_temp' in epoch_metrics:
                     print(f"    Solid T:  {np.mean(epoch_metrics['loss_solid_temp']):.6f}")
+                if 'loss_solid_grad' in epoch_metrics:
+                    print(f"    Solid Grad: {np.mean(epoch_metrics['loss_solid_grad']):.6e}")
                 if 'loss_initial' in epoch_metrics:
                     print(f"    Initial:  {np.mean(epoch_metrics['loss_initial']):.6f}")
 
@@ -547,9 +564,9 @@ def main():
 
     # Solid T — focused on fluid_i-soild surface (sterilization-critical region)
     n_solid_pts = pinn_cfg.n_solid_temp_points
-    x_s, t_s, T_s, bc_s = make_fluid_i_soild_temp_points(train_data, n_solid_pts, rng)
+    x_s, t_s, T_s, grad_T_s, bc_s = make_fluid_i_soild_temp_points(train_data, n_solid_pts, rng)
     if len(x_s) > 0:
-        solid_temp_loader = DataLoader(TensorDataset(x_s, t_s, T_s, bc_s),
+        solid_temp_loader = DataLoader(TensorDataset(x_s, t_s, T_s, grad_T_s, bc_s),
                                        batch_size=pinn_cfg.batch_size, shuffle=True)
         solid_viz_data = make_fluid_i_soild_temp_snapshot(train_data, pinn_cfg.solid_viz_case_idx, pinn_cfg.solid_viz_time_idx)
         print(f"  solid_T:     {n_solid_pts} points (inner-surface focused), "
@@ -564,9 +581,9 @@ def main():
         x_val, t_val, v_val, bc_val = make_data_points(val_data, pinn_cfg.n_val_data_points, rng)
         val_data_loader = DataLoader(TensorDataset(x_val, t_val, v_val, bc_val),
                                      batch_size=pinn_cfg.batch_size, shuffle=False)
-        x_vs, t_vs, T_vs, bc_vs = make_solid_temp_points(val_data, pinn_cfg.n_val_solid_temp_points, rng)
+        x_vs, t_vs, T_vs, grad_T_vs, bc_vs = make_solid_temp_points(val_data, pinn_cfg.n_val_solid_temp_points, rng)
         if len(x_vs) > 0:
-            val_solid_loader = DataLoader(TensorDataset(x_vs, t_vs, T_vs, bc_vs),
+            val_solid_loader = DataLoader(TensorDataset(x_vs, t_vs, T_vs, grad_T_vs, bc_vs),
                                           batch_size=pinn_cfg.batch_size, shuffle=False)
         print(f"  validation:  {pinn_cfg.n_val_data_points} fluid + {len(x_vs)} solid points")
 

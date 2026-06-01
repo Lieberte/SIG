@@ -5,7 +5,7 @@ PINN configuration for H2O2 sterilization — Multi-fluid Eulerian-Eulerian mode
   Phase 1 — carrier gas (air), with k-ω turbulence
   Phase 2 — vapor (H2O2/H2O/air vapour)
   Phase 3 — liquid (H2O2/H2O droplets)
-  Solid zone — aluminium wall (conduction only)
+  Solid zone — polymer wall (conduction only)
 
 Field layout (19 fields for fluid, 1 for solid):
   [0:3]   u1, v1, w1     Phase-1 velocity (carrier)
@@ -166,6 +166,7 @@ class PINNConfig:
     lambda_physics_fluid: float = 1.0
     lambda_physics_solid: float = 1.0
     lambda_solid_temp: float = 10.0  # fluid_i-soild T supervision (sterilization-critical)
+    lambda_solid_grad: float = 5.0   # Spatial temperature gradient supervision (preserves non-uniformity)
     lambda_bc_inlet: float = 50.0
     lambda_bc_wall: float = 5.0
     lambda_initial: float = 5.0

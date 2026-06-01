@@ -298,8 +298,8 @@ def build_training_data(mesh: dict, dat_dir: Path, dat_glob: str,
 
     print(f"  n_fluid={n_fluid}, n_solid={n_solid}, n_total={n_total}, n_time={n_time}")
 
-    fluid_coords = cell_centers[:n_fluid]
-    solid_coords = cell_centers[n_fluid:n_fluid + n_solid] if n_solid > 0 else np.zeros((0, 3))
+    fluid_coords = cell_centers[n_solid + 1 : n_solid + 1 + n_fluid]
+    solid_coords = cell_centers[1 : n_solid + 1] if n_solid > 0 else np.zeros((0, 3))
 
     all_coords = np.concatenate([fluid_coords, solid_coords], axis=0) if n_solid > 0 else fluid_coords
     coord_min = all_coords.min(axis=0)
@@ -377,6 +377,42 @@ def build_training_data(mesh: dict, dat_dir: Path, dat_glob: str,
     }
 
 
+def _precompute_solid_gradients(solid_coords: np.ndarray, raw_cases: list, k: int = 15):
+    """Precompute CFD temperature gradient vector at each solid cell using KNN least-squares.
+
+    Returns:
+        list of list of (n_solid, 3) arrays: [case_idx][time_idx] = gradient (dTdx, dTdy, dTdz)
+    """
+    from scipy.spatial import cKDTree
+    tree = cKDTree(solid_coords)
+    _, knn_idx = tree.query(solid_coords, k=k + 1)  # +1 because first is self
+    knn_idx = knn_idx[:, 1:]  # exclude self
+
+    all_grads = []
+    n_solid = len(solid_coords)
+    for case in raw_cases:
+        case_grads = []
+        for solid_T in case["solid_temp"]:
+            if solid_T.size == 0:
+                case_grads.append(np.zeros((n_solid, 3), dtype=np.float32))
+                continue
+            T_vals = np.asarray(solid_T, dtype=np.float64)
+            grad = np.zeros((n_solid, 3), dtype=np.float32)
+            for i in range(n_solid):
+                neighbors = knn_idx[i]
+                dxyz = solid_coords[neighbors] - solid_coords[i]
+                dT = T_vals[neighbors] - T_vals[i]
+                # Least-squares: solve A @ g = dT  where A = [dx, dy, dz]
+                try:
+                    g, _, _, _ = np.linalg.lstsq(dxyz, dT, rcond=None)
+                    grad[i] = g.astype(np.float32)
+                except np.linalg.LinAlgError:
+                    grad[i] = 0.0
+            case_grads.append(grad)
+        all_grads.append(case_grads)
+    return all_grads
+
+
 def build_multi_case_training_data(mesh, data_root: Path, dat_glob: str,
                                    case_glob: str = "T_*_*",
                                    use_discrete_time_input: bool = True) -> dict:
@@ -412,8 +448,8 @@ def build_multi_case_training_data(mesh, data_root: Path, dat_glob: str,
                 f"fluid={case['n_fluid']} solid={case['n_solid']}"
             )
 
-    fluid_coords = cell_centers[:n_fluid]
-    solid_coords = cell_centers[n_fluid:n_fluid + n_solid] if n_solid > 0 else np.zeros((0, 3))
+    fluid_coords = cell_centers[n_solid + 1 : n_solid + 1 + n_fluid]
+    solid_coords = cell_centers[1 : n_solid + 1] if n_solid > 0 else np.zeros((0, 3))
     all_coords = np.concatenate([fluid_coords, solid_coords], axis=0) if n_solid > 0 else fluid_coords
     coord_min = all_coords.min(axis=0)
     coord_max = all_coords.max(axis=0)
@@ -456,8 +492,12 @@ def build_multi_case_training_data(mesh, data_root: Path, dat_glob: str,
     def normalize(fd):
         return _normalize_fluid(fd, scales)
 
+    # ── Precompute CFD solid temperature spatial gradients (KNN) ──
+    print("  Computing CFD solid temperature gradients (KNN)...")
+    solid_grad_T = _precompute_solid_gradients(solid_coords, raw_cases, k=15)
+
     cases = []
-    for case in raw_cases:
+    for ic, case in enumerate(raw_cases):
         if use_discrete_time_input:
             norm_times = np.linspace(0.0, 1.0, case["n_time"], dtype=np.float64)
         else:
@@ -465,8 +505,13 @@ def build_multi_case_training_data(mesh, data_root: Path, dat_glob: str,
         norm_fluid_data = [normalize(fd) for fd in case["fluid_data"]]
         if case["n_solid"] > 0 and case["solid_temp"][0].size > 0:
             norm_solid_T = [(st - T_min) / T_range for st in case["solid_temp"]]
+            # Normalize CFD gradients: dT/dx_phys = dT_norm/dx_phys * T_range
+            # The KNN gradients are in physical units (K/m), convert to normalized gradient
+            # grad_norm = grad_phys / T_range  (since d(T_norm)/dx = d(T/T_range)/dx)
+            norm_solid_grad = [g / T_range for g in solid_grad_T[ic]]
         else:
             norm_solid_T = []
+            norm_solid_grad = []
 
         bc_params_norm = np.array([
             (case["T_preheat_K"] - T_min) / T_range,
@@ -480,6 +525,7 @@ def build_multi_case_training_data(mesh, data_root: Path, dat_glob: str,
             "norm_times": norm_times,
             "norm_fluid_data": norm_fluid_data,
             "norm_solid_T": norm_solid_T,
+            "norm_solid_grad": norm_solid_grad,
             "bc_params_norm": bc_params_norm,
             "inlet_a_T_norm": ((inlet_a_T - T_min) / T_range).astype(np.float32),
             "inlet_b_T_norm": ((inlet_b_T - T_min) / T_range).astype(np.float32),
@@ -499,7 +545,7 @@ def build_multi_case_training_data(mesh, data_root: Path, dat_glob: str,
     print(f"  fluid-solid interface faces: {len(fluid_i_soild_face_data['face_to_cell']):,}")
 
     # Classify fluid cells: near-wall vs core (for balanced sampling)
-    fluid_classification = classify_fluid_cells(mesh, n_fluid)
+    fluid_classification = classify_fluid_cells(mesh, n_fluid, n_solid)
     print(f"  Fluid classification: fluid_i={len(fluid_classification['fluid_i']):,} "
           f"(core={len(fluid_classification['fluid_i_core']):,}, wall={len(fluid_classification['fluid_i_wall']):,}), "
           f"fluid_o={len(fluid_classification['fluid_o']):,} "
@@ -525,6 +571,7 @@ def build_multi_case_training_data(mesh, data_root: Path, dat_glob: str,
         "solid_temp": first["solid_temp"],
         "norm_fluid_data": first["norm_fluid_data"],
         "norm_solid_T": first["norm_solid_T"],
+        "norm_solid_grad": first.get("norm_solid_grad", []),
         "coord_min": coord_min,
         "coord_max": coord_max,
         "coord_range": coord_range,
@@ -584,14 +631,21 @@ def get_fluid_i_soild_cells(mesh: dict, n_solid: int) -> np.ndarray:
 def classify_solid_cells(mesh: dict, n_solid: int) -> dict[str, np.ndarray]:
     """Classify all solid cells by adjacent Fluent zone.
 
-    Iterates shadow zone faces directly — shadow face_c0 is the solid-local cell index.
-    No offset math needed.
+    Iterates shadow zone faces directly — shadow face_c0 is the solid-local cell index
+    (1-based global ID).  Converts to 0-based solid-local.
 
     Returns dict with keys: fluid_i_soild, fluid_o_soild, soild_boundary, interior
     """
     face_c0 = mesh["face_c0"]
     zones = mesh.get("zones", {})
     n_solid_int = int(n_solid)
+
+    def to_solid_local(c0):
+        """Convert 1-based face_c0 to 0-based solid-local index."""
+        local = int(c0) - 1
+        if 0 <= local < n_solid_int:
+            return local
+        return -1
 
     fluid_i_soild = set()
     fluid_o_soild = set()
@@ -608,17 +662,17 @@ def classify_solid_cells(mesh: dict, n_solid: int) -> dict[str, np.ndarray]:
         if info is None:
             continue
         for fid in range(info["face_min"] - 1, info["face_max"]):
-            c0 = int(face_c0[fid])
-            if 0 <= c0 < n_solid_int:
-                target_set.add(c0)
+            sc = to_solid_local(int(face_c0[fid]))
+            if sc >= 0:
+                target_set.add(sc)
 
     # soild:1 zone — boundary faces, c0 = solid cell directly
     for name, info in zones.items():
         if name == "soild:1":
             for fid in range(info["face_min"] - 1, info["face_max"]):
-                c0 = int(face_c0[fid])
-                if 0 <= c0 < n_solid_int:
-                    soild_boundary.add(c0)
+                sc = to_solid_local(int(face_c0[fid]))
+                if sc >= 0:
+                    soild_boundary.add(sc)
             break
 
     all_solid = set(range(n_solid_int))
@@ -633,44 +687,35 @@ def classify_solid_cells(mesh: dict, n_solid: int) -> dict[str, np.ndarray]:
     }
 
 
-def classify_fluid_cells(mesh: dict, n_fluid: int) -> dict[str, np.ndarray]:
+def classify_fluid_cells(mesh: dict, n_fluid: int, n_solid: int) -> dict[str, np.ndarray]:
     """Classify fluid cells by Fluent cell zone: fluid_i, fluid_o.
 
-    Uses interior face c0 to determine which cells belong to which zone.
-    interior--fluid_i faces [2834861, 3732152] → c0 = fluid_i cells
-    interior--fluid_o faces [517851, 2834860] → c0 = fluid_o cells
+    Cell zones (1-based global IDs, confirmed from cas.h5 zoneTopology):
+      solid:   [1, n_solid]                      = 64,503 cells
+      fluid_o: [n_solid+1, n_solid+436510]        = 436,510 cells
+      fluid_i: [n_solid+436511, n_solid+n_fluid]  = 173,499 cells
 
-    Additionally tags near-wall cells via solid interface face zones.
+    Zone assignment is authoritative from cell zone ranges.
+    Wall-adjacent tags come from solid interface face zones.
 
-    Returns dict: fluid_i, fluid_o, fluid_i_wall, fluid_o_wall (0-based fluid-local).
+    Returns dict: fluid_i, fluid_o, fluid_i_wall, fluid_o_wall,
+                  fluid_i_core, fluid_o_core (all 0-based fluid-local).
     """
     face_c0 = mesh["face_c0"]
     zones = mesh.get("zones", {})
-    n_fluid_int = int(n_fluid)
+    n_solid_int = int(n_solid)
 
-    fi_all = set()
-    fo_all = set()
+    # Authoritative zone assignment from cell zone topology
+    n_fo = 436510  # fluid_o cell count per mesh zoneTopology
+    fo_all = set(range(n_fo))                     # local 0 .. 436509
+    fi_all = set(range(n_fo, int(n_fluid)))       # local 436510 .. 610008
 
-    # interior fluid zone faces: c0 identifies owning cell's zone
-    for name in zones:
-        if name == "interior--fluid_i":
-            info = zones[name]
-            for fid in range(info["face_min"] - 1, info["face_max"]):
-                c0 = int(face_c0[fid])
-                if 0 <= c0 < n_fluid_int:
-                    fi_all.add(c0)
-        elif name == "interior--fluid_o":
-            info = zones[name]
-            for fid in range(info["face_min"] - 1, info["face_max"]):
-                c0 = int(face_c0[fid])
-                if 0 <= c0 < n_fluid_int:
-                    fo_all.add(c0)
-        elif name == "fluid_o:1":
-            info = zones[name]
-            for fid in range(info["face_min"] - 1, info["face_max"]):
-                c0 = int(face_c0[fid])
-                if 0 <= c0 < n_fluid_int:
-                    fo_all.add(c0)
+    # Helper: convert 1-based global c0 to 0-based fluid-local
+    def to_fluid_local(c0):
+        local = int(c0) - n_solid_int - 1
+        if 0 <= local < int(n_fluid):
+            return local
+        return -1
 
     # Solid interface faces: tag wall-adjacent cells per zone
     fi_wall = set()
@@ -680,16 +725,13 @@ def classify_fluid_cells(mesh: dict, n_fluid: int) -> dict[str, np.ndarray]:
         if info is None:
             continue
         for fid in range(info["face_min"] - 1, info["face_max"]):
-            c0 = int(face_c0[fid])
-            if 0 <= c0 < n_fluid_int:
+            fc = to_fluid_local(int(face_c0[fid]))
+            if fc >= 0:
                 if zone_name == "fluid_i-soild":
-                    fi_wall.add(c0)
-                    fi_all.add(c0)
+                    fi_wall.add(fc)
                 else:
-                    fo_wall.add(c0)
-                    fo_all.add(c0)
+                    fo_wall.add(fc)
 
-    # Core = zone cells NOT adjacent to any wall
     fi_core = fi_all - fi_wall
     fo_core = fo_all - fo_wall
 
@@ -779,16 +821,16 @@ def make_collocation_points(data: dict, n_points: int, rng,
     n_fluid = data["n_fluid"]
     fluid_cls = data.get("fluid_classification", {})
 
-    fi_core = fluid_cls.get("fluid_i_core", None)
+    fi_all = fluid_cls.get("fluid_i", None)
 
-    if fi_core is not None and len(fi_core) > 0:
-        # 30% fluid_i_core (center), 20% all fluid, 50% all cells
-        n_fi_core = int(n_points * 0.30)
+    if fi_all is not None and len(fi_all) > 0:
+        # 30% fluid_i (uniform across entire zone), 20% all fluid, 50% all cells
+        n_fi = int(n_points * 0.30)
         n_fl = int(n_points * 0.20)
-        n_all = n_points - n_fi_core - n_fl
+        n_all = n_points - n_fi - n_fl
 
         cell_idx = np.concatenate([
-            rng.choice(fi_core, size=n_fi_core, replace=True),
+            rng.choice(fi_all, size=n_fi, replace=True),
             rng.integers(0, n_fluid, size=n_fl) if n_fl > 0 else np.array([], dtype=np.int64),
             rng.integers(0, n_total, size=n_all),
         ])
@@ -829,27 +871,24 @@ def make_collocation_points(data: dict, n_points: int, rng,
 
 
 def make_data_points(data: dict, n_points: int, rng) -> tuple:
-    """Sample fluid data points — weighted toward fluid_i core (center region)."""
+    """Sample fluid data points — uniform within each zone, with emphasis on fluid_i."""
     n_fluid = data["n_fluid"]
     fluid_cls = data.get("fluid_classification", {})
 
-    fi_core = fluid_cls.get("fluid_i_core", None)
-    fi_wall = fluid_cls.get("fluid_i_wall", None)
-    fo_cells = fluid_cls.get("fluid_o", None)
+    fi_all = fluid_cls.get("fluid_i", None)
+    fo_all = fluid_cls.get("fluid_o", None)
 
-    if fi_core is not None and len(fi_core) > 0:
-        n_fi_core = int(n_points * 0.40)
-        n_fi_wall = int(n_points * 0.20)
-        n_fo = int(n_points * 0.25)
-        n_random = n_points - n_fi_core - n_fi_wall - n_fo
+    if fi_all is not None and len(fi_all) > 0 and fo_all is not None and len(fo_all) > 0:
+        # Uniform sampling within each zone — no wall/core distinction
+        n_fi = int(n_points * 0.60)   # 60% fluid_i (uniform across entire zone)
+        n_fo = int(n_points * 0.25)   # 25% fluid_o
+        n_random = n_points - n_fi - n_fo  # 15% anywhere in fluid
 
-        parts = [rng.choice(fi_core, size=n_fi_core, replace=True),
-                 rng.choice(fi_wall, size=n_fi_wall, replace=True)]
-        if len(fo_cells) > 0:
-            parts.append(rng.choice(fo_cells, size=n_fo, replace=True))
-        else:
-            parts.append(rng.integers(0, n_fluid, size=n_fo))
-        parts.append(rng.integers(0, n_fluid, size=n_random))
+        parts = [
+            rng.choice(fi_all, size=n_fi, replace=True),
+            rng.choice(fo_all, size=n_fo, replace=True),
+            rng.integers(0, n_fluid, size=n_random),
+        ]
         cell_idx = np.concatenate(parts)
         rng.shuffle(cell_idx)
     else:
@@ -924,9 +963,19 @@ def make_initial_points(data: dict, n_points: int, rng) -> tuple:
 
 
 def make_solid_temp_points(data: dict, n_points: int, rng) -> tuple:
+    """Sample solid temperature supervision points with gradient targets.
+
+    Returns:
+        x:          [n_points, 3] normalized coordinates
+        t:          [n_points, 1] normalized time
+        v_T:        [n_points, 1] normalized temperature target
+        grad_T:     [n_points, 3] normalized temperature gradient target (dT/dx, dT/dy, dT/dz)
+        bc_params:  [n_points, 2] normalized BC parameters
+    """
     n_solid = data["n_solid"]
     if n_solid == 0 or ("cases" not in data and len(data["norm_solid_T"]) == 0):
-        return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
+        return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1),
+                torch.zeros(0, 3), torch.zeros(0, 2))
 
     cell_idx = rng.integers(0, n_solid, size=n_points)
     case_idx = _sample_cases(data, n_points, rng)
@@ -934,18 +983,23 @@ def make_solid_temp_points(data: dict, n_points: int, rng) -> tuple:
     x = data["norm_coords_all"][coord_idx]
     t = np.zeros((n_points, 1), dtype=np.float32)
     v_T = np.zeros((n_points, 1), dtype=np.float32)
+    grad_T = np.zeros((n_points, 3), dtype=np.float32)
     bc_params = np.zeros((n_points, 2), dtype=np.float32)
 
     if "cases" in data:
         for case_id, case in enumerate(data["cases"]):
-            idx = case_idx == case_id
-            if idx.sum() == 0 or len(case["norm_solid_T"]) == 0:
+            cidx = case_idx == case_id
+            if cidx.sum() == 0 or len(case["norm_solid_T"]) == 0:
                 continue
-            time_idx = rng.integers(0, case["n_time"], size=idx.sum())
+            time_idx = rng.integers(0, case["n_time"], size=cidx.sum())
             solid_array = np.array(case["norm_solid_T"])
-            t[idx, 0] = case["norm_times"][time_idx]
-            v_T[idx, 0] = solid_array[time_idx, cell_idx[idx]]
-            bc_params[idx] = _case_params(case, idx.sum())
+            t[cidx, 0] = case["norm_times"][time_idx]
+            v_T[cidx, 0] = solid_array[time_idx, cell_idx[cidx]]
+            bc_params[cidx] = _case_params(case, cidx.sum())
+            # CFD gradient targets
+            if case.get("norm_solid_grad"):
+                grad_array = np.array(case["norm_solid_grad"])
+                grad_T[cidx] = grad_array[time_idx, cell_idx[cidx]]
     else:
         time_idx = rng.integers(0, data["n_time"], size=n_points)
         solid_array = np.array(data["norm_solid_T"])
@@ -955,17 +1009,22 @@ def make_solid_temp_points(data: dict, n_points: int, rng) -> tuple:
             (data["T_preheat_K"] - data["T_min"]) / data["T_range"],
             (data["T_h2o2_K"] - data["T_min"]) / data["T_range"],
         ], dtype=np.float32)
+        # Gradients for single-case mode
+        if data.get("norm_solid_grad"):
+            grad_array = np.array(data["norm_solid_grad"])
+            grad_T[:] = grad_array[time_idx, cell_idx]
 
     return (torch.from_numpy(x).float(),
             torch.from_numpy(t).float(),
             torch.from_numpy(v_T).float(),
+            torch.from_numpy(grad_T).float(),
             torch.from_numpy(bc_params).float())
 
 
 def make_solid_temp_snapshot(data: dict, case_idx: int = 0, time_idx: int = -1) -> tuple:
     n_solid = data["n_solid"]
     if n_solid == 0:
-        return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
+        return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 3), torch.zeros(0, 2))
 
     coord_idx = np.arange(data["n_fluid"], data["n_fluid"] + n_solid)
     x = data["norm_coords_all"][coord_idx]
@@ -973,14 +1032,14 @@ def make_solid_temp_snapshot(data: dict, case_idx: int = 0, time_idx: int = -1) 
         case_idx = int(np.clip(case_idx, 0, len(data["cases"]) - 1))
         case = data["cases"][case_idx]
         if len(case["norm_solid_T"]) == 0:
-            return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
+            return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 3), torch.zeros(0, 2))
         time_idx = time_idx % case["n_time"]
         t_value = case["norm_times"][time_idx]
         v_T = np.array(case["norm_solid_T"])[time_idx].reshape(-1, 1)
         bc_params = _case_params(case, n_solid)
     else:
         if len(data["norm_solid_T"]) == 0:
-            return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
+            return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 3), torch.zeros(0, 2))
         time_idx = time_idx % data["n_time"]
         t_value = data["norm_times"][time_idx]
         v_T = np.array(data["norm_solid_T"])[time_idx].reshape(-1, 1)
@@ -989,9 +1048,16 @@ def make_solid_temp_snapshot(data: dict, case_idx: int = 0, time_idx: int = -1) 
             (data["T_h2o2_K"] - data["T_min"]) / data["T_range"],
         ]], dtype=np.float32), n_solid, axis=0)
     t = np.full((n_solid, 1), t_value, dtype=np.float32)
+    # Gradient targets
+    if "cases" in data:
+        grad_T = np.array(case.get("norm_solid_grad", [[]]))[time_idx].reshape(-1, 3) if case.get("norm_solid_grad") else np.zeros((n_solid, 3), dtype=np.float32)
+    else:
+        grad_arr = np.array(data.get("norm_solid_grad", [[]]))
+        grad_T = grad_arr[time_idx].reshape(-1, 3) if len(grad_arr) > 1 else np.zeros((n_solid, 3), dtype=np.float32)
     return (torch.from_numpy(x).float(),
             torch.from_numpy(t).float(),
             torch.from_numpy(v_T.astype(np.float32)).float(),
+            torch.from_numpy(grad_T.astype(np.float32)).float(),
             torch.from_numpy(bc_params).float())
 
 
@@ -999,7 +1065,7 @@ def make_fluid_i_soild_temp_snapshot(data: dict, case_idx: int = 0, time_idx: in
     """Full-resolution snapshot of fluid_i-soild interface — face centers (ON the surface)."""
     n_solid = data["n_solid"]
     if n_solid == 0:
-        return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
+        return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 3), torch.zeros(0, 2))
 
     face_data = data.get("fluid_i_soild_face_data", {})
     face_coords = face_data.get("norm_face_coords", None)
@@ -1022,14 +1088,14 @@ def make_fluid_i_soild_temp_snapshot(data: dict, case_idx: int = 0, time_idx: in
         case_idx = int(np.clip(case_idx, 0, len(data["cases"]) - 1))
         case = data["cases"][case_idx]
         if len(case["norm_solid_T"]) == 0:
-            return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
+            return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 3), torch.zeros(0, 2))
         time_idx = time_idx % case["n_time"]
         t_value = case["norm_times"][time_idx]
         v_T = np.array(case["norm_solid_T"])[time_idx][cell_idx].reshape(-1, 1)
         bc_params = _case_params(case, n_pts)
     else:
         if len(data["norm_solid_T"]) == 0:
-            return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
+            return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 3), torch.zeros(0, 2))
         time_idx = time_idx % data["n_time"]
         t_value = data["norm_times"][time_idx]
         v_T = np.array(data["norm_solid_T"])[time_idx][cell_idx].reshape(-1, 1)
@@ -1038,9 +1104,16 @@ def make_fluid_i_soild_temp_snapshot(data: dict, case_idx: int = 0, time_idx: in
             (data["T_h2o2_K"] - data["T_min"]) / data["T_range"],
         ]], dtype=np.float32), n_pts, axis=0)
     t = np.full((n_pts, 1), t_value, dtype=np.float32)
+    # Gradient targets (at cell_idx locations)
+    if "cases" in data:
+        grad_T = np.array(case.get("norm_solid_grad", [[]]))[time_idx][cell_idx].reshape(-1, 3) if case.get("norm_solid_grad") else np.zeros((n_pts, 3), dtype=np.float32)
+    else:
+        grad_arr = np.array(data.get("norm_solid_grad", [[]]))
+        grad_T = grad_arr[time_idx][cell_idx].reshape(-1, 3) if len(grad_arr) > 1 else np.zeros((n_pts, 3), dtype=np.float32)
     return (torch.from_numpy(x).float(),
             torch.from_numpy(t).float(),
             torch.from_numpy(v_T.astype(np.float32)).float(),
+            torch.from_numpy(grad_T.astype(np.float32)).float(),
             torch.from_numpy(bc_params).float())
 
 
@@ -1055,7 +1128,7 @@ def make_fluid_i_soild_temp_points(data: dict, n_points: int, rng) -> tuple:
     """
     n_solid = data["n_solid"]
     if n_solid == 0:
-        return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 2))
+        return (torch.zeros(0, 3), torch.zeros(0, 1), torch.zeros(0, 1), torch.zeros(0, 3), torch.zeros(0, 2))
 
     face_data = data.get("fluid_i_soild_face_data", {})
     face_coords = face_data.get("norm_face_coords", None)
@@ -1098,6 +1171,8 @@ def make_fluid_i_soild_temp_points(data: dict, n_points: int, rng) -> tuple:
     v_T = np.zeros((n_points, 1), dtype=np.float32)
     bc_params = np.zeros((n_points, 2), dtype=np.float32)
 
+    grad_T = np.zeros((n_points, 3), dtype=np.float32)
+
     if "cases" in data:
         for case_id, case in enumerate(data["cases"]):
             idx = case_idx == case_id
@@ -1108,6 +1183,9 @@ def make_fluid_i_soild_temp_points(data: dict, n_points: int, rng) -> tuple:
             t[idx, 0] = case["norm_times"][time_idx]
             v_T[idx, 0] = solid_array[time_idx, cell_idx[idx]]
             bc_params[idx] = _case_params(case, idx.sum())
+            if case.get("norm_solid_grad"):
+                grad_array = np.array(case["norm_solid_grad"])
+                grad_T[idx] = grad_array[time_idx, cell_idx[idx]]
     else:
         time_idx = rng.integers(0, data["n_time"], size=n_points)
         solid_array = np.array(data["norm_solid_T"])
@@ -1117,10 +1195,14 @@ def make_fluid_i_soild_temp_points(data: dict, n_points: int, rng) -> tuple:
             (data["T_preheat_K"] - data["T_min"]) / data["T_range"],
             (data["T_h2o2_K"] - data["T_min"]) / data["T_range"],
         ], dtype=np.float32)
+        if data.get("norm_solid_grad"):
+            grad_array = np.array(data["norm_solid_grad"])
+            grad_T[:] = grad_array[time_idx, cell_idx]
 
     return (torch.from_numpy(x).float(),
             torch.from_numpy(t).float(),
             torch.from_numpy(v_T).float(),
+            torch.from_numpy(grad_T).float(),
             torch.from_numpy(bc_params).float())
 
 

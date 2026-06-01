@@ -24,10 +24,13 @@ dat_files = sorted((DATA_DIR / "T_160_200").glob("*.dat.h5"))
 if dat_files:
     _, _, _, ps = load_multi_fluid_fields(DATA_DIR / "T_160_200", "*.dat.h5")
     n_fluid = ps["n_fluid"]
+    n_solid = ps["n_solid"]
 else:
     n_fluid = 610009
-solid_coords = cell_centers[n_fluid:]
-print(f"Fluid cells: {n_fluid}, Solid cells: {solid_coords.shape[0]}")
+    n_solid = 64503
+fluid_coords = cell_centers[n_solid + 1 : n_solid + 1 + n_fluid]
+solid_coords = cell_centers[1 : n_solid + 1]
+print(f"Fluid cells: {n_fluid}, Solid cells: {n_solid}")
 
 # Stats
 for i, axis in enumerate(["X", "Y", "Z"]):
@@ -83,7 +86,7 @@ print(f"Saved: {vtk_path}")
 
 # ===== Also visualize fluid domain boundary =====
 # Sample fluid cells near the solid interface
-fluid_coords = cell_centers[:n_fluid]
+# fluid_coords already defined above using correct cell zone split
 # Find fluid cells closest to solid (Y > some threshold)
 y_threshold = solid_coords[:, 1].min()
 nearby_fluid = fluid_coords[fluid_coords[:, 1] >= y_threshold - 0.002]
