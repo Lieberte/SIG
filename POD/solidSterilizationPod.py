@@ -171,11 +171,12 @@ def loadSterilizationSnapshots(dataRoot: Path, caseGlob: str, datGlob: str,
 
 
 def main() -> None:
+    _projectRoot = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description="POD model for F0 sterilization on fluid_i-soild faces")
-    parser.add_argument("--dataRoot", type=Path, default=Path("data2"))
+    parser.add_argument("--dataRoot", type=Path, default=_projectRoot / "data2")
     parser.add_argument("--caseGlob", default="T_*_*")
     parser.add_argument("--datGlob", default="*.dat.h5")
-    parser.add_argument("--casPath", type=Path, default=Path("data/meshData/KMB_phase_change_test.cas.h5"))
+    parser.add_argument("--casPath", type=Path, default=_projectRoot / "data" / "meshData" / "KMB_phase_change_test.cas.h5")
     parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parent / "output" / "solidSterilizationPod.npz")
     parser.add_argument("--figDir", type=Path, default=Path(__file__).resolve().parent / "output" / "figures")
     parser.add_argument("--energy", type=float, default=0.999)
