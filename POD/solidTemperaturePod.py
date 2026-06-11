@@ -147,6 +147,93 @@ def fitIdwRegression(P: np.ndarray, A: np.ndarray, neighbors: int, power: float,
     }
 
 
+def buildMlp(inputDim: int, outputDim: int, hidden: int, layers: int):
+    import torch.nn as nn
+    modules = []
+    lastDim = inputDim
+    for _ in range(max(1, int(layers))):
+        modules.extend([nn.Linear(lastDim, hidden), nn.Tanh()])
+        lastDim = hidden
+    modules.append(nn.Linear(lastDim, outputDim))
+    return nn.Sequential(*modules)
+
+
+def fitMlpRegression(
+    P: np.ndarray,
+    A: np.ndarray,
+    hidden: int,
+    layers: int,
+    epochs: int,
+    learningRate: float,
+    weightDecay: float,
+    valRatio: float,
+    patience: int,
+) -> dict:
+    try:
+        import torch
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("POD-NN requires torch.") from exc
+    PN, paramScale = normalizeParams(P)
+    Y = A.T.astype(np.float32)
+    yMean = Y.mean(axis=0, keepdims=True)
+    yStd = Y.std(axis=0, keepdims=True) + 1e-8
+    YN = (Y - yMean) / yStd
+    nSamples = PN.shape[0]
+    rng = np.random.default_rng(42)
+    order = rng.permutation(nSamples)
+    nVal = int(round(nSamples * valRatio)) if nSamples > 10 else 0
+    nVal = min(max(nVal, 0), nSamples - 1) if nSamples > 1 else 0
+    valIdx = order[:nVal]
+    trainIdx = order[nVal:]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(42)
+    model = buildMlp(PN.shape[1], YN.shape[1], int(hidden), int(layers)).to(device)
+    xTrain = torch.tensor(PN[trainIdx], dtype=torch.float32, device=device)
+    yTrain = torch.tensor(YN[trainIdx], dtype=torch.float32, device=device)
+    xVal = torch.tensor(PN[valIdx], dtype=torch.float32, device=device) if nVal > 0 else None
+    yVal = torch.tensor(YN[valIdx], dtype=torch.float32, device=device) if nVal > 0 else None
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learningRate, weight_decay=weightDecay)
+    lossFn = torch.nn.MSELoss()
+    bestLoss = float("inf")
+    bestState = None
+    noImprove = 0
+    for _ in range(int(epochs)):
+        model.train()
+        optimizer.zero_grad()
+        loss = lossFn(model(xTrain), yTrain)
+        loss.backward()
+        optimizer.step()
+        model.eval()
+        with torch.no_grad():
+            checkLoss = lossFn(model(xVal), yVal).item() if nVal > 0 else loss.item()
+        if checkLoss < bestLoss:
+            bestLoss = checkLoss
+            bestState = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            noImprove = 0
+        else:
+            noImprove += 1
+        if patience > 0 and noImprove >= patience:
+            break
+    if bestState is not None:
+        model.load_state_dict(bestState)
+    model.eval()
+    return {
+        "type": "mlp",
+        "model": model.cpu(),
+        "hidden": int(hidden),
+        "layers": int(layers),
+        "epochs": int(epochs),
+        "learningRate": float(learningRate),
+        "weightDecay": float(weightDecay),
+        "valRatio": float(valRatio),
+        "patience": int(patience),
+        "bestLoss": float(bestLoss),
+        "coeffMean": yMean.astype(np.float64),
+        "coeffStd": yStd.astype(np.float64),
+        "paramScale": paramScale,
+    }
+
+
 def fitRegression(
     P: np.ndarray,
     A: np.ndarray,
@@ -159,6 +246,13 @@ def fitRegression(
     idwNeighbors: int,
     idwPower: float,
     idwEps: float,
+    mlpHidden: int,
+    mlpLayers: int,
+    mlpEpochs: int,
+    mlpLearningRate: float,
+    mlpWeightDecay: float,
+    mlpValRatio: float,
+    mlpPatience: int,
 ) -> dict:
     if regressionType == "poly":
         return fitCoefficientRegression(P, A, degree, ridge)
@@ -166,6 +260,8 @@ def fitRegression(
         return fitRbfRegression(P, A, rbfRidge, rbfEpsilon, rbfNeighbors)
     if regressionType == "idw":
         return fitIdwRegression(P, A, idwNeighbors, idwPower, idwEps)
+    if regressionType == "mlp":
+        return fitMlpRegression(P, A, mlpHidden, mlpLayers, mlpEpochs, mlpLearningRate, mlpWeightDecay, mlpValRatio, mlpPatience)
     raise ValueError(f"Unsupported regressionType: {regressionType}")
 
 
@@ -229,6 +325,14 @@ def predictCoefficients(P: np.ndarray, regression: dict) -> np.ndarray:
         return predictLocalRbf(PN, regression)
     if regression["type"] == "idw":
         return predictIdw(PN, regression)
+    if regression["type"] == "mlp":
+        import torch
+        model = regression["model"]
+        model.eval()
+        with torch.no_grad():
+            yNorm = model(torch.tensor(PN, dtype=torch.float32)).cpu().numpy()
+        y = yNorm * regression["coeffStd"] + regression["coeffMean"]
+        return y.T
     raise ValueError(f"Unsupported regression type: {regression['type']}")
 
 
@@ -271,6 +375,13 @@ def trainPod(
     idwNeighbors: int,
     idwPower: float,
     idwEps: float,
+    mlpHidden: int,
+    mlpLayers: int,
+    mlpEpochs: int,
+    mlpLearningRate: float,
+    mlpWeightDecay: float,
+    mlpValRatio: float,
+    mlpPatience: int,
 ) -> dict:
     pod = fitPod(X, energy, maxModes)
     regression = fitRegression(
@@ -285,6 +396,13 @@ def trainPod(
         idwNeighbors,
         idwPower,
         idwEps,
+        mlpHidden,
+        mlpLayers,
+        mlpEpochs,
+        mlpLearningRate,
+        mlpWeightDecay,
+        mlpValRatio,
+        mlpPatience,
     )
     APred = predictCoefficients(P, regression)
     XPred = reconstruct(pod, APred)
@@ -502,6 +620,14 @@ def saveModel(model: dict, outputPath: Path, metadata: list[dict], P: np.ndarray
         saved["idwEps"] = np.array([regression["eps"]], dtype=np.float64)
         saved["PTrainNorm"] = regression["PTrainNorm"]
         saved["ATrain"] = regression["ATrain"]
+    if regression["type"] == "mlp":
+        saved["coeffMean"] = regression["coeffMean"]
+        saved["coeffStd"] = regression["coeffStd"]
+        saved["mlpHidden"] = np.array([regression["hidden"]], dtype=np.int32)
+        saved["mlpLayers"] = np.array([regression["layers"]], dtype=np.int32)
+        saved["mlpBestLoss"] = np.array([regression["bestLoss"]], dtype=np.float64)
+        for key, value in regression["model"].state_dict().items():
+            saved[f"mlp_{key}"] = value.detach().cpu().numpy()
     np.savez_compressed(outputPath, **saved)
     summaryPath = outputPath.with_suffix(".json")
     summary = {
@@ -532,7 +658,7 @@ def runSelfTest() -> None:
         P[i] = [t * 7.4, tp, th]
         X[:, i] = 300.0 + 25.0 * t + 0.06 * (tp - 433.15) * np.sin(np.pi * x) + 0.04 * (th - 473.15) * np.cos(2.0 * np.pi * x)
         X[:, i] += rng.normal(0.0, 0.01, size=nSolid)
-    model = trainPod(X, P, energy=0.999, maxModes=None, degree=2, ridge=1e-8, regressionType="rbf", rbfEpsilon=1.0, rbfRidge=1e-5, rbfNeighbors=64, idwNeighbors=64, idwPower=2.0, idwEps=1e-12)
+    model = trainPod(X, P, energy=0.999, maxModes=None, degree=2, ridge=1e-8, regressionType="rbf", rbfEpsilon=1.0, rbfRidge=1e-5, rbfNeighbors=64, idwNeighbors=64, idwPower=2.0, idwEps=1e-12, mlpHidden=64, mlpLayers=2, mlpEpochs=500, mlpLearningRate=1e-3, mlpWeightDecay=1e-6, mlpValRatio=0.1, mlpPatience=100)
     print(json.dumps({
         "selfTest": "ok",
         "nModes": model["pod"]["nModes"],
@@ -552,13 +678,20 @@ def main() -> None:
     parser.add_argument("--maxModes", type=int, default=config.maxModes)
     parser.add_argument("--degree", type=int, default=config.degree)
     parser.add_argument("--ridge", type=float, default=config.ridge)
-    parser.add_argument("--regressionType", choices=["poly", "rbf", "idw"], default=config.regressionType)
+    parser.add_argument("--regressionType", choices=["poly", "rbf", "idw", "mlp"], default=config.regressionType)
     parser.add_argument("--rbfEpsilon", type=float, default=config.rbfEpsilon)
     parser.add_argument("--rbfRidge", type=float, default=config.rbfRidge)
     parser.add_argument("--rbfNeighbors", type=int, default=config.rbfNeighbors)
     parser.add_argument("--idwNeighbors", type=int, default=config.idwNeighbors)
     parser.add_argument("--idwPower", type=float, default=config.idwPower)
     parser.add_argument("--idwEps", type=float, default=config.idwEps)
+    parser.add_argument("--mlpHidden", type=int, default=getattr(config, "mlpHidden", 128))
+    parser.add_argument("--mlpLayers", type=int, default=getattr(config, "mlpLayers", 3))
+    parser.add_argument("--mlpEpochs", type=int, default=getattr(config, "mlpEpochs", 3000))
+    parser.add_argument("--mlpLearningRate", type=float, default=getattr(config, "mlpLearningRate", 1e-3))
+    parser.add_argument("--mlpWeightDecay", type=float, default=getattr(config, "mlpWeightDecay", 1e-6))
+    parser.add_argument("--mlpValRatio", type=float, default=getattr(config, "mlpValRatio", 0.1))
+    parser.add_argument("--mlpPatience", type=int, default=getattr(config, "mlpPatience", 300))
     parser.add_argument("--testRatio", type=float, default=config.testRatio)
     parser.add_argument("--splitMode", choices=["temporal", "random", "case"], default=config.splitMode)
     parser.add_argument("--testCases", default=config.testCases)
@@ -593,6 +726,13 @@ def main() -> None:
         args.idwNeighbors,
         args.idwPower,
         args.idwEps,
+        args.mlpHidden,
+        args.mlpLayers,
+        args.mlpEpochs,
+        args.mlpLearningRate,
+        args.mlpWeightDecay,
+        args.mlpValRatio,
+        args.mlpPatience,
     )
     _, trainMetrics = evaluatePod(model, X[:, trainIdx], P[trainIdx])
     testPred, testMetrics = evaluatePod(model, X[:, testIdx], P[testIdx])

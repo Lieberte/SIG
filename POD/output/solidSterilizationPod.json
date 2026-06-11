@@ -1,0 +1,140 @@
+{
+  "nSolid": 30175,
+  "nSnapshots": 3,
+  "nModes": 1,
+  "energy": NaN,
+  "regressionType": "poly",
+  "metrics": {
+    "mseK2": 0.0,
+    "rmseK": 0.0,
+    "maeK": 0.0,
+    "relativeRmse": 0.0,
+    "actualMinK": 0.0,
+    "actualMaxK": 0.0,
+    "predMinK": 0.0,
+    "predMaxK": 0.0,
+    "errorMinK": 0.0,
+    "errorMaxK": 0.0,
+    "absErrorMaxK": 0.0
+  },
+  "cases": [
+    {
+      "caseName": "T_75_170",
+      "casePath": "data2\\T_75_170",
+      "tPreheatK": 348.15,
+      "tH2O2K": 443.15,
+      "nSnapshots": 3,
+      "timeMin": 0.2,
+      "timeMax": 8.2,
+      "times": [
+        0.2,
+        0.4,
+        8.2
+      ],
+      "snapshotStart": 0,
+      "snapshotEnd": 3
+    }
+  ],
+  "fieldType": "F0",
+  "udmColumn": 2,
+  "faceZone": "fluid_i-soild",
+  "faceStart": 57944,
+  "faceCount": 30175,
+  "splitMode": "temporal",
+  "testRatio": 0.33,
+  "rbfEpsilon": 1.0,
+  "rbfRidge": 1e-05,
+  "rbfNeighbors": 64,
+  "idwNeighbors": 64,
+  "idwPower": 2.0,
+  "idwEps": 1e-12,
+  "mlpHidden": 128,
+  "mlpLayers": 3,
+  "mlpEpochs": 3000,
+  "mlpLearningRate": 0.001,
+  "mlpWeightDecay": 1e-06,
+  "mlpValRatio": 0.1,
+  "mlpPatience": 300,
+  "nComparePoints": 6,
+  "cloudCasesPerRun": 0,
+  "cloudSnapshotsPerCase": 3,
+  "trainCases": [
+    "T_75_170"
+  ],
+  "testCases": [
+    "T_75_170"
+  ],
+  "trainIdx": [
+    0,
+    1
+  ],
+  "testIdx": [
+    2
+  ],
+  "trainMetrics": {
+    "mseK2": 0.0,
+    "rmseK": 0.0,
+    "maeK": 0.0,
+    "relativeRmse": 0.0,
+    "actualMinK": 0.0,
+    "actualMaxK": 0.0,
+    "predMinK": 0.0,
+    "predMaxK": 0.0,
+    "errorMinK": 0.0,
+    "errorMaxK": 0.0,
+    "absErrorMaxK": 0.0
+  },
+  "testMetrics": {
+    "mseK2": 0.02715600009705844,
+    "rmseK": 0.16479077673540604,
+    "maeK": 0.14910678530785187,
+    "relativeRmse": 2.348608516111087,
+    "actualMinK": 0.07370284641134447,
+    "actualMaxK": 1.1585851213821248,
+    "predMinK": 0.0,
+    "predMaxK": 0.0,
+    "errorMinK": -1.1585851213821248,
+    "errorMaxK": -0.07370284641134447,
+    "absErrorMaxK": 1.1585851213821248
+  },
+  "trainProjectionMetrics": {
+    "mseK2": 0.0,
+    "rmseK": 0.0,
+    "maeK": 0.0,
+    "relativeRmse": 0.0,
+    "actualMinK": 0.0,
+    "actualMaxK": 0.0,
+    "predMinK": 0.0,
+    "predMaxK": 0.0,
+    "errorMinK": 0.0,
+    "errorMaxK": 0.0,
+    "absErrorMaxK": 0.0
+  },
+  "testProjectionMetrics": {
+    "mseK2": 0.02715292203409082,
+    "rmseK": 0.16478143716478147,
+    "maeK": 0.14909668545350888,
+    "relativeRmse": 2.3484754079630443,
+    "actualMinK": 0.07370284641134447,
+    "actualMaxK": 1.1585851213821248,
+    "predMinK": 0.0,
+    "predMaxK": 0.304763104800914,
+    "errorMinK": -1.1585851213821248,
+    "errorMaxK": 0.0,
+    "absErrorMaxK": 1.1585851213821248
+  },
+  "pointIdx": [
+    1953,
+    10161,
+    0,
+    3612,
+    5371,
+    6907
+  ],
+  "figures": {
+    "cloudCompare": [
+      "F:\\SIG\\POD\\output\\figures\\cloudCompare_F0_T_75_170_snapshot_0002.png"
+    ],
+    "threePointCompare": "F:\\SIG\\POD\\output\\figures\\threePointCompare_F0.png"
+  }
+}
